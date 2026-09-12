@@ -1,0 +1,6 @@
+name: astrbot_plugin_intent_router
+display_name: 智能意图路由
+desc: 用低成本 LLM 判断群聊消息是否值得主人格主动回复，零触发词、可批量、可缓存
+version: v1.0.0
+author: Codex
+repo: https://github.com/exneverbur/astrbot_plugin_intent_router

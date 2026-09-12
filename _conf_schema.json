@@ -1,0 +1,248 @@
+{
+  "enable": {
+    "description": "启用插件",
+    "hint": "是否启用本插件。关闭后插件不监听任何消息，不影响 AstrBot 正常对话。",
+    "obvious_hint": true,
+    "type": "bool",
+    "default": true
+  },
+  "judge_provider": {
+    "description": "判断用 LLM 供应商（下拉选择）",
+    "hint": "在下拉列表中选择已配置的 LLM 供应商（Provider），每个 Provider 自带模型，选择供应商即同时确定模型。留空使用会话当前默认 Provider。建议在模型配置里新建一个使用低成本模型（如 gpt-4o-mini、deepseek-chat）的 Provider，让判断调用与主人格分离、降低 Token 消耗。",
+    "_special": "select_provider",
+    "obvious_hint": true,
+    "type": "string",
+    "default": ""
+  },
+  "persona": {
+    "description": "简略人设",
+    "hint": "一句话人设，注入判断 Prompt（{persona}），让模型按这个人设判断哪些消息值得回复。越简略 token 消耗越少，不用写完整人设。",
+    "obvious_hint": true,
+    "type": "text",
+    "default": "你是群里的傲娇网瘾 AI 少女。群友会叫你「大肥鱼」「蓝色大肥鱼」「蓝色小虎鲸」「ds」「deepseek」——有人这样叫你或点名让你说话时，就是在叫你本人，你要回应。平时你会在群里观察聊天，遇到美食、AI 技术、编程、吐槽、求助这类话题会主动搭话。纯表情/复读、普通寒暄、其他人之间的私聊话题（比如约逛街）你不会参与。"
+  },
+  "enable_batch": {
+    "description": "启用批量判断",
+    "hint": "是否启用批量判断。开启后按群聚积消息、一次 LLM 调用判断多条；关闭则降级为单条即时判断（延迟更低但 Token 消耗更高）。",
+    "obvious_hint": true,
+    "type": "bool",
+    "default": true
+  },
+  "batch_size": {
+    "description": "批量触发条数",
+    "hint": "缓冲消息达到该条数即触发一次批量判断（默认 5 条）。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 5
+  },
+  "batch_interval": {
+    "description": "批量最大等待秒数",
+    "hint": "自首条消息入队起超过该秒数就强制触发批量判断。这也是无指向群消息的最长回复延迟，想更快的主动回复可调小（如 5~10）。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 30
+  },
+  "adaptive": {
+    "description": "自适应等待",
+    "hint": "开启后采用随机动态等待：首批消息入队时随机取一个初始等待（interval_min ~ 2×interval_min 秒），之后每新加入一条消息随机延长 0 ~ interval_step 秒，总等待不超过 batch_interval。冷群只等初始随机时长，火热群会不断延长以攒更多对话。关闭则固定按 batch_interval 等待。",
+    "obvious_hint": true,
+    "type": "bool",
+    "default": true
+  },
+  "interval_min": {
+    "description": "冷群最短等待秒数",
+    "hint": "自适应开启时，首批消息入队的随机初始等待为 interval_min ~ 2×interval_min 秒（不超过 batch_interval），即冷群只有一两条消息时的大致等待时间。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 5
+  },
+  "interval_step": {
+    "description": "每条新消息随机延长上限",
+    "hint": "自适应开启时，缓冲里每新加入一条消息就随机延长 0 ~ interval_step 秒的等待时间，让火热群攒更多对话再判断；总等待不超过 batch_interval。设为 0 表示新消息不再延长。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 8
+  },
+  "max_batch": {
+    "description": "单次最多判断条数",
+    "hint": "单次批量判断最多处理的消息条数，超出部分延至下一轮，防止上下文溢出。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 20
+  },
+  "buffer_cap": {
+    "description": "每群缓冲上限",
+    "hint": "每个群的待判断消息缓冲上限，超出丢弃最旧消息。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 100
+  },
+  "buffer_age": {
+    "description": "缓冲消息过期秒数",
+    "hint": "消息在缓冲中超过该秒数直接丢弃，避免回复过期话题。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 60
+  },
+  "threshold": {
+    "description": "置信度阈值",
+    "hint": "判断置信度阈值（0~1）。模型返回 worth=true 且 confidence >= 阈值才放行；调高更保守、调低更话痨。",
+    "obvious_hint": true,
+    "type": "float",
+    "default": 0.5
+  },
+  "link_virtual_world": {
+    "description": "联动「虚拟世界」插件",
+    "hint": "检测到 astrbot_plugin_virtual_world 时，放行阈值会跟着她在虚拟世界里的「社交欲」动态变化：社交欲越高越容易放行（她更想接话），越低越安静。会话没在虚拟世界白名单里时沿用上面的固定阈值。",
+    "obvious_hint": true,
+    "type": "bool",
+    "default": true
+  },
+  "vw_threshold_max": {
+    "description": "联动：社交欲=0 时的阈值",
+    "hint": "她完全没有社交欲时的放行阈值（相当于更安静）。默认 0.75。",
+    "obvious_hint": false,
+    "type": "float",
+    "default": 0.75
+  },
+  "vw_threshold_min": {
+    "description": "联动：社交欲=1 时的阈值",
+    "hint": "她社交欲拉满时的放行阈值（相当于更愿意接话）。默认 0.3。",
+    "obvious_hint": false,
+    "type": "float",
+    "default": 0.3
+  },
+  "vw_cache_seconds": {
+    "description": "联动状态缓存秒数",
+    "hint": "读取她在虚拟世界里的状态后缓存多久，避免每条消息都查一次。默认 10 秒。",
+    "obvious_hint": false,
+    "type": "int",
+    "default": 10
+  },
+  "release": {
+    "description": "批量放行策略",
+    "hint": "latest=一批只放行最新一条值得回复的消息（防刷屏，默认）；all=全部值得回的都放行。",
+    "obvious_hint": true,
+    "type": "string",
+    "default": "latest"
+  },
+  "fail_mode": {
+    "description": "失败处理策略",
+    "hint": "LLM 不可用或输出解析失败时的处理：block=拦截待判断消息（fail-closed，默认）；pass=放行（fail-open，可能回复更多）。",
+    "obvious_hint": true,
+    "type": "string",
+    "default": "block"
+  },
+  "min_length": {
+    "description": "最小有效字符数",
+    "hint": "消息有效字符数（中文/字母/数字）低于此值视为噪音直接拦截，不调用 LLM。中文短句建议 1~2。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 2
+  },
+  "noise_words": {
+    "description": "无信息量词汇表",
+    "hint": "整条消息精确匹配这些词汇时直接拦截，不调用 LLM。可自定义，例如打卡、签到、冒泡等。",
+    "obvious_hint": true,
+    "type": "list",
+    "default": ["打卡", "签到", "冒泡", "收到", "顶", "+1"]
+  },
+  "pass_prefix": {
+    "description": "直接放行前缀",
+    "hint": "以此前缀开头的消息直接放行，不做意图判断（内置命令已自动放行，此项用于自定义前缀）。",
+    "obvious_hint": true,
+    "type": "list",
+    "default": []
+  },
+  "bot_aliases": {
+    "description": "机器人称呼别名",
+    "hint": "消息中提到这些称呼（如机器人、bot、小助手等）时视为在直接对机器人说话，直接放行不做意图判断。留空则不启用别名匹配。",
+    "obvious_hint": true,
+    "type": "list",
+    "default": []
+  },
+  "cache": {
+    "description": "启用结果缓存",
+    "hint": "是否启用判断结果缓存。同会话相同文本在缓存有效期内直接复用上次判断，避免重复调用 LLM。",
+    "obvious_hint": true,
+    "type": "bool",
+    "default": true
+  },
+  "cache_ttl": {
+    "description": "缓存秒数",
+    "hint": "判断结果缓存时间（秒），默认 300 秒（5 分钟）。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 300
+  },
+  "cache_cap": {
+    "description": "缓存上限",
+    "hint": "缓存最大条目数，超出自动清理最旧条目，防止内存膨胀。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 2000
+  },
+  "context_len": {
+    "description": "附带群背景条数",
+    "hint": "批量判断时附带最近 N 条该群聊天记录作为上下文背景（0 表示不带背景）。背景只属于本群，不会混入其他群消息。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 10
+  },
+  "whitelist": {
+    "description": "群白名单",
+    "hint": "只对列出的群 ID 生效，留空表示所有群。",
+    "obvious_hint": true,
+    "type": "list",
+    "default": []
+  },
+  "blacklist": {
+    "description": "群黑名单",
+    "hint": "不对列出的群 ID 生效（隐私/合规用）。",
+    "obvious_hint": true,
+    "type": "list",
+    "default": []
+  },
+  "json_mode": {
+    "description": "JSON mode",
+    "hint": "是否以 JSON mode 请求判断模型（OpenAI 兼容 Provider 支持），可提高输出稳定性。不支持的 Provider 会自动降级重试。",
+    "obvious_hint": true,
+    "type": "bool",
+    "default": false
+  },
+  "temperature": {
+    "description": "判断温度",
+    "hint": "判断 LLM 的 temperature，默认 0 保证输出稳定。",
+    "obvious_hint": true,
+    "type": "float",
+    "default": 0.0
+  },
+  "max_tokens": {
+    "description": "最大输出 token",
+    "hint": "判断 LLM 的最大输出 token 数，防止返回过长。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 256
+  },
+  "concurrency": {
+    "description": "判断并发上限",
+    "hint": "同时进行的判断 LLM 调用数上限。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 4
+  },
+  "debug": {
+    "description": "调试模式",
+    "hint": "开启后把大模型判断的输入、输出和每条消息的判断结果输出到后台日志（含群消息内容，注意隐私）。排查判断不准时打开。",
+    "obvious_hint": true,
+    "type": "bool",
+    "default": false
+  },
+  "passthrough": {
+    "description": "其他插件优先（透传）",
+    "hint": "开启后不再拦截消息，让其他插件（表情包、签到等）也能处理；若其他插件已回复该消息，AI 不再重复回复。默认关闭：插件会在入口拦截噪音和待判断消息。",
+    "obvious_hint": true,
+    "type": "bool",
+    "default": true
+  }
+}
