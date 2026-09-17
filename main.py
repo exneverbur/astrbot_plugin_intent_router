@@ -100,7 +100,7 @@ def _resolve_data_dir(plugin_dir: str) -> str:
 
 @register(
     PLUGIN_NAME,
-    "Codex",
+    "exneverbur",
     "智能意图路由：判断群里的消息值不值得让主人格开口回复",
     "v2.0.0",
 )
