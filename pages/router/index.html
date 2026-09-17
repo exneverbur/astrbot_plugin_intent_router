@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>意图路由看板</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <h1>意图路由看板</h1>
+        <div class="topbar-right">
+          <label class="field inline">
+            <span>会话</span>
+            <select id="session"></select>
+          </label>
+          <label class="field inline">
+            <span>统计窗口</span>
+            <select id="window">
+              <option value="86400">近 24 小时</option>
+              <option value="259200">近 3 天</option>
+              <option value="604800" selected>近 7 天</option>
+              <option value="2592000">近 30 天</option>
+            </select>
+          </label>
+          <label class="switch">
+            <input type="checkbox" id="enable-toggle" />
+            <span>插件启用</span>
+          </label>
+          <label class="switch">
+            <input type="checkbox" id="proactive-toggle" />
+            <span>主动插嘴</span>
+          </label>
+          <button id="refresh" class="primary">刷新</button>
+        </div>
+      </header>
+
+      <p class="muted" id="status-line">加载中…</p>
+
+      <section class="cards" id="cards"></section>
+
+      <section class="grid two">
+        <div class="card">
+          <h2>她此刻的意愿分布</h2>
+          <p class="muted">意愿来自「虚拟世界」时，就是她当时的综合回复意愿；没装则是固定值。</p>
+          <div id="willingness-chart" class="chart"></div>
+        </div>
+        <div class="card">
+          <h2>密度惩罚分布</h2>
+          <p class="muted">越接近 1 表示"她最近说得不多，可以放心开口"；被压到很低说明话太密了。</p>
+          <div id="penalty-chart" class="chart"></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>判定流水</h2>
+        <p class="muted">
+          每条进入路由的消息都会留一行：分数、概率分解、最终决策。觉得判错就点该行的 👍 / 👎，
+          统计里的"误触发"就是这么攒出来的。
+        </p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>id</th>
+                <th>时间</th>
+                <th>会话</th>
+                <th>内容</th>
+                <th>分数</th>
+                <th>决策</th>
+                <th>p</th>
+                <th>理由</th>
+                <th>标记</th>
+              </tr>
+            </thead>
+            <tbody id="judgement-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>核心参数</h2>
+        <p class="muted">
+          改完点保存立刻生效，不用回 AstrBot 面板重载插件。参数存成
+          <code>overrides.json</code>；想回到默认点「恢复默认」。
+        </p>
+        <div id="params-form" class="params"></div>
+        <div class="row">
+          <button id="params-save" class="primary">保存参数</button>
+          <button id="params-reset" class="ghost">恢复默认</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>数据</h2>
+        <p class="muted" id="data-line"></p>
+        <div class="row">
+          <button id="data-export" class="ghost">导出 JSON</button>
+          <button id="data-prune" class="ghost">按保留天数清理</button>
+          <button id="data-clear" class="danger">清空全部记录</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

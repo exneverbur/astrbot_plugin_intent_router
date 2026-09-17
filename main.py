@@ -1,20 +1,26 @@
-"""AstrBot 智能意图路由插件（Intent Router）
+"""智能意图路由（v2）：判断群里的消息值不值得让主人格开口。
 
-职责：
-- 只监听群聊消息，判断哪些消息"值得 AI 主人格主动回复"（私聊完全不参与）；
-- 只做意图判断与消息路由，不生成任何回复内容；
-- 通过低成本 LLM（judge_provider，面板下拉选择，Provider 自带模型）批量判断，控制 Token 消耗；
-- 值得回复的群消息通过事件队列重注入（带 At 唤醒标记），交给主人格正常回复。
+分三层，各管各的：
+
+- **路由模型**（`core/judge.py`）只判内容，输出 0~1 结构化分数，不生成回复；
+- **本插件**（这个文件）负责概率、熔断、排队、放行/拦截、记录与统计；
+- **虚拟世界 VM**（可选）只提供一个「她现在想不想说话」的意愿值。
+
+她说过的话由**发送层钩子**统一记录（不区分来源——其他插件不会配合我们，
+所以任何发送动作都算她开口了），密度惩罚、硬熔断都基于这份记录。
 """
+
+from __future__ import annotations
 
 import asyncio
 import copy
 import json
+import os
 import random
-import re
 import time
 import uuid
 from collections import deque
+from pathlib import Path
 from typing import Any, Optional
 
 from astrbot.api import AstrBotConfig, logger
@@ -22,397 +28,416 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Reply
 from astrbot.api.star import Context, Star, register
 
-# handler 优先级：高于主人格（默认 0），低于框架内部 maxsize 级别的控制 handler。
-# 如需调整，可改这里（AstrBot 的 handler 按 priority 从高到低执行）。
+try:  # 看板用的 Web API 工具；老版本 AstrBot / 单测环境里可能没有
+    from astrbot.api.web import error_response, json_response, request
+except Exception:  # pragma: no cover - 只在缺少 web 模块时走到
+    request = None  # type: ignore[assignment]
+
+    def json_response(data: Any = None, status_code: int = 200, headers: Any = None) -> Any:
+        return {"status": "ok", "data": data, "status_code": status_code}
+
+    def error_response(message: str, status_code: int = 400, data: Any = None, headers: Any = None) -> Any:
+        return {"status": "error", "message": message, "status_code": status_code}
+
+from .core.config import (
+    OverrideStore,
+    RuntimeStore,
+    Tunable,
+    cfg_bool,
+    cfg_int,
+    cfg_list,
+    cfg_str,
+    settings_from_config,
+)
+from .core.decision import (
+    BLOCKED,
+    IGNORE,
+    PROACTIVE,
+    REPLY,
+    SAFETY,
+    Verdict,
+    decide_proactive,
+    decide_reply,
+)
+from .core.judge import JudgeCache, JudgePrompt, cache_key, parse_judge_output
+from .core.provider import MODE_AUTO, WillingnessProvider
+from .core.registry import Registry
+from .core.safety import SafetyLayer
+from .core.stats import build_report
+from .core.storage import Storage
+from .core.textutil import clean_text, clip, is_noise
+
+PLUGIN_NAME = "astrbot_plugin_intent_router"
+# 比默认 0 高：先于普通插件看到消息，才能决定要不要拦下来
 HANDLER_PRIORITY = 100
+# 比 VM 的 -100 高，这样"主动插嘴"的约束会追加在它那段世界认知之后
+LLM_HOOK_PRIORITY = 90
+REINJECT_EXTRA = "intent_router_reinject"
+PROACTIVE_EXTRA = "intent_router_proactive"
+DATA_DIR_ENV = "INTENT_ROUTER_DATA_DIR"
 
-# 重注入事件标记：避免被本插件再次判断造成循环
-REINJECT_EXTRA = "intent_router_judged"
-
-# 内置判断 Prompt。{persona} 会替换为配置中的 persona（简略人设）。
-# 配置 judge_prompt 后完全覆盖本 Prompt，仍可使用 {persona} 占位符。
-DEFAULT_JUDGE_PROMPT = (
-    "你是一个群聊消息判断器。下面会给出一个群聊中最近的消息背景和一批待判断消息，"
-    "请判断其中哪些消息值得 AI 助手主动回复。\n"
-    "\n"
-    "AI 助手的人设（简略）：{persona}\n"
-    "\n"
-    "值得回复（worth=true）：\n"
-    "- 用户提出具体问题（知识、技术、建议、预测等）\n"
-    "- 用户请求帮助或解释\n"
-    "- 用户分享想法/经历，AI 可补充信息或给出观点\n"
-    "- 用户表达情绪，AI 可适当共情或安慰\n"
-    "- 其他符合该人设、值得 AI 主动参与的话题\n"
-    "\n"
-    "不值得回复（worth=false）：\n"
-    "- 日常社交邀约（吃饭、出去玩、见面等）\n"
-    "- 纯闲聊无信息量（吃了没、在干嘛等）\n"
-    "- 打听他人隐私（年龄、收入、住址等）\n"
-    "- 纯感叹/重复（太好了、哈哈等）\n"
-    "- 与 AI 能力无关且无需 AI 参与的内容\n"
-    "\n"
-    "要求：\n"
-    "1. 待判断消息的序号从 1 开始，与消息列表一一对应。\n"
-    "2. 每条消息自行推断\"谁对谁说\"：from 为发送者（抄自消息列表）；to 为该消息可能的接收对象"
-    "（\"机器人\"/某个用户的昵称/\"大家\"/\"不确定\"）；directed 表示是否明确在对机器人'我'说话。\n"
-    "3. 对每条消息写一句简短原因（reason，不超过 15 个字），再给出判断结果。\n"
-    "4. 只输出一个 JSON 对象，不要输出任何解释或其他内容。\n"
-    '5. 输出格式：{"results":[{"idx":1,"from":"张三","to":"机器人","directed":true,"reason":"明确向机器人提问","worth":true,"confidence":0.9},'
-    '{"idx":2,"from":"李四","to":"王五","directed":false,"reason":"两人之间的对话","worth":false,"confidence":0.8}]}\n'
-    "6. confidence 是 0~1 的小数，表示你对该判断的把握程度。\n"
-    "7. 拿不准时优先 worth=false。"
+PROACTIVE_HINT = (
+    "\n\n【这一条是偶尔插一句】\n"
+    "只偶尔插一句，不展开、不追问、不@人。\n"
+    "不超过20字，符合角色口吻。\n"
+    "接得住梗就接，接不住就短吐槽。不刷存在感。"
 )
 
-# 指向性判断规则（追加在系统提示词中）
-DIRECTED_RULES = (
-    "\n"
-    "指向性判断（谁对谁说）：\n"
-    "- 群聊中人们通常不会特意使用\"回复\"功能，消息列表里的\"(回复 xxx)\"标记仅供参考，不是唯一依据。\n"
-    "- 请根据消息内容与上下文自行推断每条消息可能是在对谁说（to 字段）：例如提到/接续某人的话题、"
-    "回应某人的问题、直接问机器人、或者只是对大家说。\n"
-    "- to 为\"机器人\"或内容明显在对机器人说话时（directed=true），默认值得回复，除非明显不友好或纯噪音。\n"
-    "- to 为某个具体用户时（两人之间的对话），默认不值得回复，除非 AI 能明显补充价值。\n"
-    "- to 为\"大家\"或\"不确定\"时，按上文的值得/不值得标准判断。\n"
-    "- 某个话题已在多人之间连续讨论多轮、且机器人从未参与时，属于人类之间的持续对话，"
-    "默认不要中途插入回复。\n"
-)
 
-# 纯语气词/笑声（哈哈哈、嘿嘿、呵呵、hahaha、hehe、hhhh 等）
-_LAUGHTER_RE = re.compile(
-    r"^(?:(?:哈|嘻|嘿|呵)+|(?:ha+|he+|hi+|h+)+)$",
-    re.IGNORECASE,
-)
+def _resolve_data_dir(plugin_dir: str) -> str:
+    """数据目录：AstrBot 的 data/plugin_data/<插件名>/（可用环境变量覆盖）。"""
 
-# 常用 emoji 范围（用于"纯表情"噪音识别）
-_EMOJI_RE = re.compile(
-    "["
-    "\U0001F000-\U0001FAFF"  # 主要表情符号区
-    "\U0001F1E6-\U0001F1FF"  # 国旗
-    "\u2600-\u27BF"  # 杂项符号/装饰符号
-    "\u2B00-\u2BFF"  # 箭头/杂项符号
-    "\u2190-\u21FF"  # 箭头
-    "\uFE0F\u200D\u2764\u2B50"
-    "]"
-)
-
-# 有效字符：中文、字母、数字
-_EFFECTIVE_CHAR_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]")
-
-
-def _cfg_str(config: AstrBotConfig, key: str, default: str) -> str:
-    v = config.get(key, default)
-    return str(v) if v is not None else default
-
-
-def _cfg_bool(config: AstrBotConfig, key: str, default: bool) -> bool:
-    v = config.get(key, default)
-    if isinstance(v, str):
-        return v.strip().lower() in ("1", "true", "yes", "on", "开启", "是")
-    return bool(v)
-
-
-def _cfg_int(config: AstrBotConfig, key: str, default: int) -> int:
+    override = (os.environ.get(DATA_DIR_ENV) or "").strip()
+    if override:
+        return override
     try:
-        return int(config.get(key, default))
+        from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+
+        return os.path.join(get_astrbot_plugin_data_path(), PLUGIN_NAME)
     except Exception:
-        return default
+        return os.path.join(plugin_dir, "data")
 
 
-def _cfg_float(config: AstrBotConfig, key: str, default: float) -> float:
-    try:
-        return float(config.get(key, default))
-    except Exception:
-        return default
-
-
-def _cfg_list(config: AstrBotConfig, key: str, default: list) -> list:
-    v = config.get(key, default)
-    return list(v) if isinstance(v, (list, tuple)) else default
-
-
-@register("astrbot_plugin_intent_router", "Codex", "智能意图路由：判断哪些消息值得主人格主动回复", "0.1.0")
+@register(
+    PLUGIN_NAME,
+    "Codex",
+    "智能意图路由：判断群里的消息值不值得让主人格开口回复",
+    "v2.0.0",
+)
 class IntentRouterPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context, config)
-
-        self.enable = _cfg_bool(config, "enable", True)
-        self.judge_provider_id = _cfg_str(config, "judge_provider", "").strip()
-        self.bot_persona = _cfg_str(config, "persona", "乐于助人的AI助手").strip()
-        self.judge_prompt = _cfg_str(config, "judge_prompt", "").strip()
-
-        self.enable_batch = _cfg_bool(config, "enable_batch", True)
-        self.batch_size = max(1, _cfg_int(config, "batch_size", 5))
-        self.batch_interval = max(1, _cfg_int(config, "batch_interval", 30))
-        self.adaptive = _cfg_bool(config, "adaptive", True)
-        self.interval_min = max(1, _cfg_int(config, "interval_min", 5))
-        self.interval_step = max(0, _cfg_int(config, "interval_step", 5))
-        if self.interval_min > self.batch_interval:
-            self.interval_min = self.batch_interval
-        self.max_batch = max(1, _cfg_int(config, "max_batch", 20))
-        self.buffer_max_capacity = max(1, _cfg_int(config, "buffer_cap", 100))
-        self.buffer_max_age = max(1, _cfg_int(config, "buffer_age", 60))
-
-        self.confidence_threshold = min(
-            1.0, max(0.0, _cfg_float(config, "threshold", 0.5))
+        self.config = config
+        self.data_dir = _resolve_data_dir(os.path.dirname(os.path.abspath(__file__)))
+        self.settings = settings_from_config(config, data_dir=self.data_dir)
+        self.overrides = OverrideStore(Path(self.data_dir) / "overrides.json")
+        self.tunable: Tunable = self.overrides.load()
+        self.runtime = RuntimeStore(
+            Path(self.data_dir) / "runtime.json",
+            {"enable": bool(self.settings.enable)},
         )
+        self._runtime = self.runtime.load()
 
-        # 与「虚拟世界」插件联动：她在那里越有社交欲，放行阈值越低（越愿意接话）
-        self.link_virtual_world = _cfg_bool(config, "link_virtual_world", True)
-        self.vw_threshold_min = min(
-            1.0, max(0.0, _cfg_float(config, "vw_threshold_min", 0.3))
+        self.storage = Storage(Path(self.data_dir) / "router.db")
+        self.registry = Registry(self.storage, self.tunable)
+        self.provider = WillingnessProvider(
+            mode=MODE_AUTO,
+            tunable=self.tunable,
+            vm_getter=lambda: self._virtual_world_plugin(),
         )
-        self.vw_threshold_max = min(
-            1.0, max(0.0, _cfg_float(config, "vw_threshold_max", 0.75))
+        self.safety = SafetyLayer(
+            block_words=cfg_list(config, "block_words"),
+            flag_words=cfg_list(config, "flag_words"),
+            block_regex=cfg_list(config, "block_regex"),
+            max_length=max(200, cfg_int(config, "max_text_length", 2000)),
         )
-        self.vw_cache_seconds = max(1, _cfg_int(config, "vw_cache_seconds", 10))
-        self._vw_threshold_cache: dict[str, tuple[float, float]] = {}
-        self._vw_link_logged = False
-        self._vw_sleep_logged = False
-        self.release_policy = _cfg_str(config, "release", "latest").strip().lower()
-        if self.release_policy not in ("latest", "all"):
-            self.release_policy = "latest"
-        self.failure_policy = _cfg_str(config, "fail_mode", "block").strip().lower()
-        if self.failure_policy not in ("block", "pass"):
-            self.failure_policy = "block"
+        self.judge_prompt = JudgePrompt(self.settings)
+        self.cache = JudgeCache(
+            ttl=self.settings.cache_ttl, capacity=self.settings.cache_cap
+        )
+        self.enable = bool(self._runtime.get("enable", self.settings.enable))
+        self.debug = bool(self.settings.debug)
 
-        self.min_length = max(0, _cfg_int(config, "min_length", 2))
-        self.noise_words = _cfg_list(config, "noise_words", ["打卡", "签到", "冒泡", "收到", "顶", "+1"])
-        self.pass_prefixes = _cfg_list(config, "pass_prefix", [])
-        self.bot_aliases = [
-            str(a).strip().lower()
-            for a in _cfg_list(config, "bot_aliases", [])
-            if str(a).strip()
-        ]
-
-        self.enable_cache = _cfg_bool(config, "cache", True)
-        self.cache_ttl = max(1, _cfg_int(config, "cache_ttl", 300))
-        self.cache_max_entries = max(10, _cfg_int(config, "cache_cap", 2000))
-        self.context_window = max(0, _cfg_int(config, "context_len", 10))
-
-        self.groups_whitelist = _cfg_list(config, "whitelist", [])
-        self.groups_blacklist = _cfg_list(config, "blacklist", [])
-
-        self.json_mode = _cfg_bool(config, "json_mode", False)
-        self.temperature = _cfg_float(config, "temperature", 0.0)
-        self.max_tokens = max(1, _cfg_int(config, "max_tokens", 256))
-        self.judge_concurrency = max(1, _cfg_int(config, "concurrency", 4))
-        self.debug = _cfg_bool(config, "debug", False)
-        self.other_plugins_priority = _cfg_bool(config, "passthrough", False)
-
-        # 运行时状态
+        # ---------------- 运行时状态 ----------------
         self._buffers: dict[str, deque] = {}
         self._buffer_lock = asyncio.Lock()
         self._history: dict[str, deque] = {}
         self._deadlines: dict[str, float] = {}
-        self._cache: dict[tuple, dict] = {}
-        self._judge_semaphore = asyncio.Semaphore(self.judge_concurrency)
+        self._judge_semaphore = asyncio.Semaphore(self.settings.concurrency)
         self._flush_task: Optional[asyncio.Task] = None
+        self._delayed: set[asyncio.Task] = set()
         self._seq = 0
-        self._stats = {
-            "noise_blocked": 0,
+        self._vm_logged = False
+        self.counters: dict[str, int] = {
+            "noise": 0,
             "cache_hits": 0,
+            "judged": 0,
             "judge_calls": 0,
-            "batch_judged": 0,
-            "blocked": 0,
             "released": 0,
-            "released_candidate": 0,
+            "delayed": 0,
+            "blocked": 0,
+            "proactive": 0,
+            "safety_blocked": 0,
+            "safety_flagged": 0,
+            "judge_failed": 0,
             "dropped_stale": 0,
             "dropped_overflow": 0,
             "reinject_failed": 0,
-            "skipped_other_plugin_reply": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
         }
+        self._register_web_apis()
+        logger.info(
+            "intent_router v2 已加载：批量=%s(%d条/%.0fs) 判断模型=%s 主动插嘴=%s",
+            "开" if self.settings.enable_batch else "关",
+            self.settings.batch_size,
+            self.settings.batch_interval,
+            self.settings.judge_provider_id or "(会话默认)",
+            "开" if self.tunable.proactive_enabled else "关",
+        )
 
-    # ------------------------------------------------------------------
-    # 消息入口
-    # ------------------------------------------------------------------
-    # 只监听群聊消息；私聊消息不会进入本插件处理逻辑
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=HANDLER_PRIORITY)
+    # ==================================================================
+    # 生命周期
+    # ==================================================================
+
+    async def initialize(self) -> None:
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._flush_loop())
+        try:
+            self.storage.prune(self.tunable.keep_days)
+        except Exception as exc:
+            logger.debug(f"intent_router: 清理历史数据失败：{exc}")
+        vm = self._virtual_world_plugin()
+        if vm is not None:
+            logger.info("intent_router: 检测到「虚拟世界」，意愿值跟随她在那个世界里的状态")
+            self._vm_logged = True
+        else:
+            logger.info(
+                "intent_router: 没检测到「虚拟世界」，意愿值用固定 %.2f"
+                "（运行中会一直重试，装上就自动接上）",
+                self.tunable.willingness_default,
+            )
+
+    async def terminate(self) -> None:
+        task, self._flush_task = self._flush_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        for pending in list(self._delayed):
+            pending.cancel()
+        self._delayed.clear()
+        try:
+            self.storage.close()
+        except Exception:
+            pass
+        logger.info("intent_router 已卸载")
+
+    # ==================================================================
+    # 钩子
+    # ==================================================================
+
+    @filter.event_message_type(
+        filter.EventMessageType.GROUP_MESSAGE, priority=HANDLER_PRIORITY
+    )
     async def on_message(self, event: AstrMessageEvent) -> None:
         try:
             await self._route(event)
-        except Exception as e:
-            logger.error(f"intent_router 处理消息异常: {e}", exc_info=True)
-            # 兜底：不拦截，让消息继续走后续插件/主人格
+        except Exception as exc:  # 出问题也必须放行，别把人堵在门口
+            logger.error(f"intent_router: 处理消息异常：{exc}", exc_info=True)
+
+    @filter.after_message_sent()
+    async def on_bot_message_sent(self, event: AstrMessageEvent) -> None:
+        """发送层钩子：只要有发送动作就算她开口了。
+
+        不去识别是哪个插件发的、也不判断发送成没成功——其他插件不会配合我们，
+        而"她说了话"这件事本身就是密度惩罚最需要的信号。
+        """
+
+        try:
+            self.registry.record_speech(event.unified_msg_origin)
+        except Exception as exc:
+            logger.debug(f"intent_router: 记录发言失败：{exc}")
+
+    @filter.on_llm_request(priority=LLM_HOOK_PRIORITY)
+    async def on_llm_request(self, event: AstrMessageEvent, req: Any) -> None:
+        """主动插嘴时给主人格加一句约束（只有插嘴才加，正常回复不动）。"""
+
+        if not event.get_extra(PROACTIVE_EXTRA):
+            return
+        try:
+            req.system_prompt = (getattr(req, "system_prompt", "") or "") + PROACTIVE_HINT
+        except Exception as exc:
+            logger.debug(f"intent_router: 注入插嘴约束失败：{exc}")
+
+    @filter.command("router", alias={"意图路由", "ir"})
+    async def cmd_router(self, event: AstrMessageEvent):
+        args = (event.get_message_str() or "").strip().split()
+        sub = args[1].lower() if len(args) > 1 else "stats"
+        umo = event.unified_msg_origin
+        if sub in ("stats", "状态"):
+            report = build_report(
+                storage=self.storage,
+                provider_status=self.provider.status(),
+                counters=self.counters,
+                tunable=self.tunable,
+                umo=umo,
+                window_seconds=86400,
+                recent_limit=5,
+            )
+            counts = report["counts"]["by_decision"]
+            yield event.plain_result(
+                "意图路由（近 24 小时）：\n"
+                f"· 判断 {report['counts']['judged']} 条，放行 {counts.get(REPLY, 0)}、"
+                f"插嘴 {counts.get(PROACTIVE, 0)}、熔断 {counts.get(BLOCKED, 0)}、"
+                f"不回 {counts.get(IGNORE, 0)}\n"
+                f"· 意愿来源 {report['willingness_provider']['mode']}"
+                f"（熔断中：{'是' if report['willingness_provider']['breaker_open'] else '否'}）\n"
+                f"· 最近：W={report['latest']['weighted_recent_W']} "
+                f"load={report['latest']['normalized_load']} "
+                f"willingness={report['latest']['willingness']}"
+            )
+            return
+        if sub in ("on", "off", "开", "关"):
+            if not event.is_admin():
+                yield event.plain_result("只有管理员可以开关意图路由。")
+                return
+            self.enable = sub in ("on", "开")
+            yield event.plain_result("意图路由已" + ("开启" if self.enable else "关闭"))
+            return
+        if sub in ("good", "bad", "对", "错"):
+            if len(args) < 3:
+                yield event.plain_result("用法：/router good|bad <判定 id>")
+                return
+            value = "good" if sub in ("good", "对") else "bad"
+            ok = self.storage.set_feedback(int(args[2]), value)
+            yield event.plain_result("已记下这条判定" if ok else "没找到这条判定")
+            return
+        yield event.plain_result(
+            "意图路由指令：\n"
+            "· /router stats        看当前群的统计\n"
+            "· /router on|off       开关（管理员）\n"
+            "· /router good|bad <id> 标记这条判断对不对（看板里也能标）"
+        )
+
+    # ==================================================================
+    # 路由主流程
+    # ==================================================================
 
     async def _route(self, event: AstrMessageEvent) -> None:
         if not self.enable:
             return
-        # 机器人自己的消息（平台回显等）不处理
         if event.get_sender_id() and event.get_sender_id() == event.get_self_id():
             return
-        # 本插件重注入的消息：直接放行，避免循环
         if event.get_extra(REINJECT_EXTRA, False):
-            return
+            return  # 本插件重注入的消息，放行
+        text = clean_text(event.message_str or "")
+        umo = event.unified_msg_origin
 
-        text = self._clean_text(event.message_str or "")
-        is_group = not event.is_private_chat()
+        if text:
+            self._history_append(umo, text)
 
-        # 群聊消息写入背景历史（供批量判断参考）
-        item_uuid = uuid.uuid4().hex if (is_group and text) else None
-        if is_group and text:
-            self._history_append(event, text, item_uuid)
-
-        # 兜底：私聊不处理（正常由 GROUP_MESSAGE 过滤器保证私聊消息不会进入本 handler）
-        if event.is_private_chat():
-            return
-
-        # 直接指向 bot / 唤醒 / 命令：直接放行
+        # 直接指向她 / 命令：规则触发，不过模型
         if self._is_direct(event):
             return
-
-        if is_group and not self._in_scope(event):
+        if not self._in_scope(event):
             return
-
         if not text:
-            # 纯图片等无文本消息：不判断，放行
-            return
+            return  # 纯图片等没有文本的消息不判断
 
-        if self._is_noise(text):
-            self._stats["noise_blocked"] += 1
+        safety = self.safety.check(text)
+        if safety.blocked:
+            self.counters["safety_blocked"] += 1
+            logger.info("intent_router: 安全层拦下一条消息（%s）", safety.reason)
+            self._block_event(event)
+            return
+        if safety.flagged:
+            self.counters["safety_flagged"] += 1
+
+        if is_noise(text, min_length=self.settings.min_length, noise_words=self.settings.noise_words):
+            self.counters["noise"] += 1
             self._block_event(event)
             return
 
-        cache_key = (event.unified_msg_origin, text)
-        cached = self._cache_get(cache_key)
+        key = cache_key(umo, text)
+        now = time.time()
+        cached = self.cache.get(key, now)
         if cached is not None:
-            self._stats["cache_hits"] += 1
-            if cached["worth"]:
-                self._mark_wake(event)
-                self._stats["released"] += 1
-            else:
-                self._block_event(event)
+            self.counters["cache_hits"] += 1
+            await self._apply_decision(
+                event=event,
+                umo=umo,
+                text=text,
+                verdict=cached,
+                cached=True,
+                deferred=False,
+            )
             return
 
-        if self.enable_batch and is_group:
-            self._buffer_add(event, text, cache_key, item_uuid)
+        item = self._make_item(event, text, key)
+        if self.settings.enable_batch:
+            self._buffer_add(umo, item)
             self._block_event(event)
             return
+        await self._judge_and_decide([item], umo, deferred=False)
 
-        # 单条即时判断（enable_batch=false 时）
-        item = self._make_item(event, text, cache_key, item_uuid)
-        await self._judge_single(event, item)
-
-    # ------------------------------------------------------------------
-    # 分流判断
-    # ------------------------------------------------------------------
     def _is_direct(self, event: AstrMessageEvent) -> bool:
-        """直接指向 bot 的消息（@、回复、唤醒前缀、命令）→ 放行。"""
-        if event.is_at_or_wake_command:
+        """直接指向她（@、回复、唤醒前缀、命令、叫名字）→ 直接放行，不花判断的钱。"""
+
+        if getattr(event, "is_at_or_wake_command", False):
             return True
         if event.get_extra("handlers_parsed_params", {}):
             return True
-        s = event.message_str or ""
-        for p in self.pass_prefixes:
-            if p and s.startswith(p):
+        text = event.message_str or ""
+        if text.startswith(("/", "!", "！")):
+            return True  # 指令一律放行（含 /router 自己）
+        for prefix in self.settings.pass_prefixes:
+            if prefix and text.startswith(prefix):
                 return True
-        if self.bot_aliases:
-            sl = s.lower()
-            for alias in self.bot_aliases:
-                if alias and alias in sl:
-                    return True
-        return False
+        lowered = text.lower()
+        return any(alias and alias.lower() in lowered for alias in self.settings.aliases)
 
     def _in_scope(self, event: AstrMessageEvent) -> bool:
         gid = event.get_group_id()
-        if self.groups_whitelist and gid not in self.groups_whitelist:
+        if self.settings.whitelist and gid not in self.settings.whitelist:
             return False
-        if gid and gid in self.groups_blacklist:
-            return False
-        return True
-
-    def _is_noise(self, text: str) -> bool:
-        t = text.strip()
-        if not t:
-            return True
-        # 纯表情
-        if _EMOJI_RE.sub("", t).strip() == "":
-            return True
-        # 纯标点/符号
-        effective = _EFFECTIVE_CHAR_RE.findall(t)
-        if not effective:
-            return True
-        # 纯语气词/笑声
-        if _LAUGHTER_RE.match(t):
-            return True
-        # 有效字符数不足
-        if len(effective) < self.min_length:
-            return True
-        # 单字符重复（1111、好好好好）
-        if len(t) >= 2 and len(set(t)) == 1:
-            return True
-        # 无信息量词汇（精确匹配）
-        if t in self.noise_words:
-            return True
-        return False
-
-    def _mark_wake(self, event: AstrMessageEvent) -> None:
-        """将事件标记为唤醒，使主 LLM agent 在管道末尾正常回复。"""
-        event.is_wake = True
-        event.is_at_or_wake_command = True
+        return not (gid and gid in self.settings.blacklist)
 
     def _block_event(self, event: AstrMessageEvent) -> None:
-        """严格模式：拦截事件，后续插件不再处理。
-        透传模式（passthrough=true）：不拦截，让其他插件也能处理。
-        """
-        if not self.other_plugins_priority:
-            event.stop_event()
-
-    # ------------------------------------------------------------------
-    # 批量缓冲与刷新
-    # ------------------------------------------------------------------
-    def _buffer_add(self, event: AstrMessageEvent, text: str, cache_key: tuple, item_uuid: str) -> None:
-        umo = event.unified_msg_origin
-        buf = self._buffers.setdefault(umo, deque())
-        was_empty = not buf
-        item = self._make_item(event, text, cache_key, item_uuid)
-        buf.append(item)
-        if self.adaptive:
-            if was_empty:
-                # 随机初始等待：interval_min ~ 2*interval_min（不超过 batch_interval）
-                initial = random.uniform(
-                    self.interval_min,
-                    min(self.interval_min * 2, self.batch_interval),
-                )
-                self._deadlines[umo] = item["ts"] + initial
-            else:
-                # 每条新消息随机延长一点，最多不超过 batch_interval（按首条消息计）
-                inc = random.uniform(0, self.interval_step)
-                deadline = self._deadlines.get(
-                    umo, buf[0]["ts"] + self.interval_min
-                ) + inc
-                self._deadlines[umo] = min(deadline, buf[0]["ts"] + self.batch_interval)
-        while len(buf) > self.buffer_max_capacity:
-            buf.popleft()
-            self._stats["dropped_overflow"] += 1
-
-    def _make_item(self, event: AstrMessageEvent, text: str, cache_key: tuple, item_uuid: Optional[str]) -> dict:
-        self._seq += 1
-        reply_to = ""
         try:
-            msg_obj = getattr(event, "message_obj", None)
-            chain = getattr(msg_obj, "message", None)
-            if isinstance(chain, list):
-                for comp in chain:
-                    if isinstance(comp, Reply):
-                        nick = str(getattr(comp, "sender_nickname", "") or "").strip()
-                        sid = str(getattr(comp, "sender_id", "") or "").strip()
-                        reply_to = nick or sid
-                        break
+            event.stop_event()
         except Exception:
             pass
+
+    def _mark_wake(self, event: AstrMessageEvent) -> None:
+        try:
+            event.is_wake = True
+        except Exception:
+            pass
+
+    # ==================================================================
+    # 缓冲：攒一批再判，省 token
+    # ==================================================================
+
+    def _make_item(self, event: AstrMessageEvent, text: str, key: str) -> dict[str, Any]:
+        self._seq += 1
         return {
             "event": event,
             "text": text,
-            "cache_key": cache_key,
-            "uuid": item_uuid or uuid.uuid4().hex,
+            "key": key,
+            "uuid": uuid.uuid4().hex,
             "ts": time.time(),
             "seq": self._seq,
-            "sender_name": self._sender_name(event),
-            "reply_to": reply_to,
+            "sender": self._sender_name(event),
+            "label": self._item_label(event),
         }
+
+    def _item_label(self, event: AstrMessageEvent) -> str:
+        """给判断模型看的说话人标注：昵称 + 引用了谁。"""
+
+        who = self._sender_name(event)
+        quoted = self._quoted_name(event)
+        return f"{who}（回复 {quoted}）" if quoted else who
+
+    def _buffer_add(self, umo: str, item: dict[str, Any]) -> None:
+        buf = self._buffers.setdefault(umo, deque())
+        was_empty = not buf
+        buf.append(item)
+        if was_empty:
+            self._deadlines[umo] = item["ts"] + random.uniform(
+                min(5.0, self.settings.batch_interval), self.settings.batch_interval
+            )
+        else:
+            self._deadlines[umo] = min(
+                self._deadlines.get(umo, item["ts"]),
+                buf[0]["ts"] + self.settings.batch_interval,
+            )
+        while len(buf) > 100:
+            buf.popleft()
+            self.counters["dropped_overflow"] += 1
 
     async def _flush_loop(self) -> None:
         while True:
@@ -423,146 +448,271 @@ class IntentRouterPlugin(Star):
                 for umo, buf in list(self._buffers.items()):
                     if not buf:
                         continue
-                    if len(buf) >= self.batch_size:
+                    if len(buf) >= self.settings.batch_size:
                         due.append(umo)
-                        continue
-                    if self._flush_due(umo, buf, now):
+                    elif now - buf[0]["ts"] >= self.settings.batch_interval:
+                        due.append(umo)
+                    elif now >= self._deadlines.get(umo, 0.0):
                         due.append(umo)
                 for umo in due:
                     try:
                         await self._flush_group(umo)
-                    except Exception as e:
-                        logger.error(f"intent_router: 刷新缓冲失败 umo={umo}: {e}")
+                    except Exception as exc:
+                        logger.error(f"intent_router: 刷新缓冲失败 umo={umo}：{exc}")
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.error(f"intent_router: 后台刷新循环异常: {e}")
+            except Exception as exc:
+                logger.error(f"intent_router: 后台刷新循环异常：{exc}")
 
     async def _flush_group(self, umo: str) -> None:
-        items: list[dict] = []
+        items: list[dict[str, Any]] = []
         async with self._buffer_lock:
             buf = self._buffers.get(umo)
             if not buf:
                 return
             now = time.time()
-            # 丢弃过期消息，避免回复几十秒前的话题
-            while buf and now - buf[0]["ts"] > self.buffer_max_age:
+            while buf and now - buf[0]["ts"] > self.settings.buffer_seconds:
                 buf.popleft()
-                self._stats["dropped_stale"] += 1
-            for _ in range(min(self.max_batch, len(buf))):
+                self.counters["dropped_stale"] += 1
+            while buf and len(items) < 20:
                 items.append(buf.popleft())
             if not buf:
                 self._buffers.pop(umo, None)
                 self._deadlines.pop(umo, None)
+        if items:
+            await self._judge_and_decide(items, umo)
+
+    # ==================================================================
+    # 判断 + 决策 + 落库
+    # ==================================================================
+
+    async def _judge_and_decide(
+        self, items: list[dict[str, Any]], umo: str, *, deferred: bool = True
+    ) -> None:
+        """判断一批消息并落地决策。
+
+        ``deferred=True`` 表示这些消息已经被拦下、放在缓冲里了（放行要靠重注入）；
+        ``deferred=False`` 是单条即时判断，消息还活着（放行 = 什么都不做）。
+        """
+
+        verdicts = await self._judge(items, umo)
+        if not verdicts:
+            self.counters["judge_failed"] += 1
+            if self.settings.failure_policy == "pass":
+                if deferred:
+                    self._release(items)
             else:
-                # 有剩余消息，刷新截止时间仍受 batch_interval 上限约束
-                self._deadlines[umo] = min(
-                    self._deadlines.get(umo, now + self.interval_min),
-                    buf[0]["ts"] + self.batch_interval,
-                )
-        if not items:
+                self.counters["blocked"] += len(items)
+                for item in items:
+                    self._block_event(item["event"])
             return
-
-        self._stats["judge_calls"] += 1
-        self._stats["batch_judged"] += len(items)
-        history_lines = self._build_history_lines(umo, items)
-        user_prompt = self._build_user_prompt(items, history_lines)
-        system_prompt = self._build_system_prompt()
-        if self.debug:
-            logger.info("intent_router 判断输入:\n%s\n---\n%s", system_prompt, user_prompt)
-
-        parsed = await self._call_judge(system_prompt, user_prompt, umo)
-        if parsed is None:
-            logger.error(
-                f"intent_router: 批量判断失败(umo={umo})，按 fail_mode={self.failure_policy} 处理"
-            )
-            if self.failure_policy == "pass":
-                self._release_items(items)
-            else:
-                for it in items:
-                    self._stats["blocked"] += 1
-            return
-
-        by_idx = {r["idx"]: r for r in parsed}
-        released: list[dict] = []
-        threshold = await self._effective_threshold(umo)
-        for i, it in enumerate(items, 1):
-            r = by_idx.get(i)
-            if r is None:
-                self._cache_set(it["cache_key"], False, 1.0)
-                self._stats["blocked"] += 1
-                if self.debug:
-                    logger.info(
-                        "intent_router 判断结果: idx=%d 文本=%r 格式异常，按不值得处理",
-                        i,
-                        it["text"],
-                    )
+        for index, item in enumerate(items, start=1):
+            verdict = verdicts.get(index)
+            if verdict is None:
+                # 模型漏了这条：当成不值得回，别去打扰主人格
+                self.cache.set(item["key"], Verdict(idx=index, worth=False), time.time())
+                self.counters["blocked"] += 1
+                self._block_event(item["event"])
                 continue
-            self._cache_set(it["cache_key"], r["worth"], r["confidence"])
+            self.cache.set(item["key"], verdict, time.time())
+            await self._apply_decision(
+                event=item["event"],
+                umo=umo,
+                text=item["text"],
+                verdict=verdict,
+                deferred=deferred,
+            )
+
+    async def _apply_decision(
+        self,
+        *,
+        event: AstrMessageEvent,
+        umo: str,
+        text: str,
+        verdict: Verdict,
+        cached: bool = False,
+        deferred: bool = True,
+    ) -> None:
+        """把一条判断落成"回 / 插一句 / 不回"，并写进流水。"""
+
+        now = time.time()
+        snapshot = self.registry.snapshot(umo, now)
+        willing = await self.provider.get(umo)
+
+        if willing.sleeping:
+            # 她在睡觉：静默，连记录都不用（睡眠门禁在 VM 那边也有，这里再挡一道）
+            self.counters["blocked"] += 1
+            self._block_event(event)
+            return
+
+        safety = self.safety.check(text, risk=verdict.risk)
+        if safety.blocked:
+            self.counters["safety_blocked"] += 1
+            self._block_event(event)
+            self._persist(
+                umo=umo,
+                text=text,
+                verdict=verdict,
+                decision=SAFETY,
+                probability=0.0,
+                reason=safety.reason,
+                willing=willing.value,
+                snapshot=snapshot,
+            )
+            return
+
+        if verdict.worth:
+            outcome = decide_reply(
+                verdict,
+                willingness=willing.value,
+                density=snapshot.as_density(),
+                tunable=self.tunable,
+            )
+            self._persist(
+                umo=umo,
+                text=text,
+                verdict=verdict,
+                decision=outcome.decision,
+                probability=outcome.probability,
+                reason=outcome.reason,
+                willing=willing.value,
+                snapshot=snapshot,
+            )
+            if outcome.delay > 0:
+                if deferred:
+                    self._schedule_release(event, outcome.delay)
+                self.counters["delayed"] += 1
+            elif deferred:
+                self._release([{"event": event}])
             if self.debug:
                 logger.info(
-                    "intent_router 判断结果: idx=%d worth=%s confidence=%.2f from=%s to=%s directed=%s reason=%s 文本=%r",
-                    i,
-                    r["worth"],
-                    r["confidence"],
-                    r.get("from", ""),
-                    r.get("to", ""),
-                    r.get("directed", False),
-                    r.get("reason", ""),
-                    it["text"],
+                    "intent_router 放行：%s（worth=%s score=%.2f 意愿=%.2f %s）",
+                    clip(text, 40),
+                    verdict.worth,
+                    verdict.reply_score,
+                    willing.value,
+                    "缓存" if cached else "",
                 )
-            if r["worth"] and r["confidence"] >= threshold:
-                released.append(it)
-            else:
-                self._stats["blocked"] += 1
-        self._stats["released_candidate"] += len(released)
-        self._release_items(released)
+            return
 
-    def _flush_due(self, umo: str, buf: deque, now: float) -> bool:
-        """判断该群缓冲是否该刷新了。
-        规则：满 batch_size 立即刷；超过 batch_interval（硬上限）刷；
-        自适应开启时，到达该批的动态截止时间（随机初始值 + 每条新消息随机延长）刷。"""
-        if len(buf) >= self.batch_size:
-            return True
-        if now - buf[0]["ts"] >= self.batch_interval:
-            return True
-        if not self.adaptive:
-            return False
-        deadline = self._deadlines.get(umo, buf[0]["ts"] + self.interval_min)
-        return now >= deadline
+        outcome = decide_proactive(
+            verdict,
+            willingness=willing.value,
+            density=snapshot.as_density(),
+            counts=snapshot.counts,
+            tunable=self.tunable,
+        )
+        self._persist(
+            umo=umo,
+            text=text,
+            verdict=verdict,
+            decision=outcome.decision,
+            probability=outcome.probability,
+            reason=outcome.reason,
+            willing=willing.value,
+            snapshot=snapshot,
+        )
+        if outcome.decision == PROACTIVE and random.random() < outcome.probability:
+            self.counters["proactive"] += 1
+            try:
+                event.set_extra(PROACTIVE_EXTRA, True)
+            except Exception:
+                pass
+            logger.info(
+                "intent_router: 主动插一句（p=%.3f）%s",
+                outcome.probability,
+                clip(text, 40),
+            )
+            if deferred:
+                self._release([{"event": event}])
+            return
+        self.counters["blocked"] += 1
+        self._block_event(event)
+        if self.debug:
+            logger.info(
+                "intent_router 不回复：%s（rare=%.2f confidence=%.2f → %s）",
+                clip(text, 40),
+                verdict.rare_interject_score,
+                verdict.confidence,
+                outcome.reason,
+            )
 
-    def _release_items(self, items: list[dict]) -> None:
+    def _persist(
+        self,
+        *,
+        umo: str,
+        text: str,
+        verdict: Verdict,
+        decision: str,
+        probability: float,
+        reason: str,
+        willing: float,
+        snapshot: Any,
+    ) -> None:
+        try:
+            self.storage.record_judgement(
+                umo=umo,
+                ts=time.time(),
+                sender=verdict.sender,
+                text=text,
+                worth=verdict.worth,
+                scores=verdict.scores(),
+                decision=decision,
+                probability=probability,
+                breakdown={
+                    "willingness": round(float(willing), 4),
+                    "weighted_recent": snapshot.weighted_recent,
+                    "normalized_load": snapshot.normalized_load,
+                    "silence_seconds": snapshot.silence_seconds,
+                    "counts": snapshot.counts,
+                    "to": verdict.to,
+                    "directed": verdict.directed,
+                    "suggested_action": verdict.suggested_action,
+                },
+                reason=reason,
+            )
+        except Exception as exc:
+            logger.debug(f"intent_router: 写判定流水失败：{exc}")
+
+    # ==================================================================
+    # 放行 / 排队 / 重注入
+    # ==================================================================
+
+    def _schedule_release(self, event: AstrMessageEvent, delay: float) -> None:
+        """意愿偏低时排队延迟一会儿再放行（而不是直接拒绝）。"""
+
+        async def later() -> None:
+            try:
+                await asyncio.sleep(max(0.0, delay))
+                self._release([{"event": event}])
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(f"intent_router: 延迟放行失败：{exc}")
+
+        task = asyncio.create_task(later())
+        self._delayed.add(task)
+        task.add_done_callback(self._delayed.discard)
+
+    def _release(self, items: list[dict[str, Any]]) -> None:
+        """把值得回的消息放回去走正常管道（带上 @ 唤醒标记）。"""
+
         if not items:
             return
-        if self.release_policy == "latest":
-            # 从最新一条开始，遇到已被其他插件回复的则回退到更早的一条
-            ordered = sorted(items, key=lambda it: (it["ts"], it["seq"]), reverse=True)
-            for it in ordered:
-                if self.other_plugins_priority and getattr(
-                    it["event"], "_has_send_oper", False
-                ):
-                    # 其他插件已经回复了这条消息，避免 AI 重复回复
-                    self._stats["skipped_other_plugin_reply"] += 1
-                    continue
-                self._reinject(it["event"])
-                self._stats["released"] += 1
-                break
-        else:
-            for it in items:
-                if self.other_plugins_priority and getattr(
-                    it["event"], "_has_send_oper", False
-                ):
-                    self._stats["skipped_other_plugin_reply"] += 1
-                    continue
-                self._reinject(it["event"])
-                self._stats["released"] += 1
+        if self.settings.release_policy == "latest":
+            ordered = sorted(items, key=lambda it: it.get("seq", 0), reverse=True)
+            self._reinject(ordered[0]["event"])
+            self.counters["released"] += 1
+            return
+        for item in items:
+            self._reinject(item["event"])
+            self.counters["released"] += 1
 
     def _reinject(self, event: AstrMessageEvent) -> None:
         """把消息副本（带 At 唤醒标记）放回事件队列，重新走一遍管道。"""
+
         try:
             new_event = copy.copy(event)
-            # 原事件可能已被 stop_event()（缓冲时拦截过），副本必须清除
-            # 停止/结果状态，否则重注入后会在管道第一站就被丢弃。
             if hasattr(new_event, "_force_stopped"):
                 new_event._force_stopped = False
             if hasattr(new_event, "clear_result"):
@@ -570,323 +720,144 @@ class IntentRouterPlugin(Star):
             if hasattr(new_event, "_has_send_oper"):
                 new_event._has_send_oper = False
             new_event._extras = dict(getattr(event, "_extras", {}) or {})
-            msg_obj = getattr(new_event, "message_obj", None)
-            chain = getattr(msg_obj, "message", None)
+            message_obj = getattr(new_event, "message_obj", None)
+            chain = getattr(message_obj, "message", None)
             self_id = event.get_self_id()
             if isinstance(chain, list):
                 has_at_self = any(
-                    isinstance(c, At) and str(getattr(c, "qq", "")) == str(self_id)
-                    for c in chain
+                    isinstance(item, At) and str(getattr(item, "qq", "")) == str(self_id)
+                    for item in chain
                 )
                 if not has_at_self:
                     chain.insert(0, At(qq=self_id, name=self_id))
             new_event.set_extra(REINJECT_EXTRA, True)
             self.context.get_event_queue().put_nowait(new_event)
-        except Exception as e:
-            logger.error(f"intent_router: 重注入消息失败: {e}")
-            self._stats["reinject_failed"] += 1
+        except Exception as exc:
+            self.counters["reinject_failed"] += 1
+            logger.error(f"intent_router: 重注入失败：{exc}")
 
-    # ------------------------------------------------------------------
-    # 单条即时判断
-    # ------------------------------------------------------------------
-    async def _judge_single(self, event: AstrMessageEvent, item: dict) -> None:
-        self._stats["judge_calls"] += 1
-        history_lines = self._build_history_lines(event.unified_msg_origin, [item])
-        user_prompt = self._build_user_prompt([item], history_lines)
-        system_prompt = self._build_system_prompt()
-        if self.debug:
-            logger.info("intent_router 判断输入:\n%s\n---\n%s", system_prompt, user_prompt)
+    # ==================================================================
+    # 判断模型
+    # ==================================================================
 
-        parsed = await self._call_judge(system_prompt, user_prompt, event.unified_msg_origin)
-        if parsed is None:
-            if self.failure_policy == "pass":
-                self._mark_wake(event)
-                self._stats["released"] += 1
-            else:
-                self._block_event(event)
-                self._stats["blocked"] += 1
-            return
+    async def _judge(self, items: list[dict[str, Any]], umo: str) -> dict[int, Verdict]:
+        """调路由模型，一次判一批。返回 ``{idx: Verdict}``（失败返回空）。"""
 
-        r = parsed[0] if parsed else None
-        threshold = await self._effective_threshold(event.unified_msg_origin)
-        if r and r["idx"] == 1 and r["worth"] and r["confidence"] >= threshold:
-            self._mark_wake(event)
-            self._stats["released"] += 1
-            self._cache_set(item["cache_key"], True, r["confidence"])
-            if self.debug:
-                logger.info(
-                    "intent_router 判断结果: 放行 confidence=%.2f from=%s to=%s directed=%s reason=%s 文本=%r",
-                    r["confidence"],
-                    r.get("from", ""),
-                    r.get("to", ""),
-                    r.get("directed", False),
-                    r.get("reason", ""),
-                    item["text"],
-                )
-        else:
-            self._block_event(event)
-            self._stats["blocked"] += 1
-            self._cache_set(item["cache_key"], False, r["confidence"] if r else 1.0)
-            if self.debug:
-                logger.info(
-                    "intent_router 判断结果: 拦截 confidence=%.2f from=%s to=%s directed=%s reason=%s 文本=%r",
-                    r["confidence"] if r else 0.0,
-                    r.get("from", "") if r else "",
-                    r.get("to", "") if r else "",
-                    r.get("directed", False) if r else False,
-                    r.get("reason", "") if r else "",
-                    item["text"],
-                )
+        if not items:
+            return {}
+        history = self._history_lines(umo)
+        payload = [
+            {"idx": index, "sender": item["sender"], "label": item["label"], "text": item["text"]}
+            for index, item in enumerate(items, start=1)
+        ]
+        system_prompt = self.judge_prompt.system()
+        user_prompt = self.judge_prompt.user(payload, history)
+        raw, error = await self._call_judge(system_prompt, user_prompt, umo)
+        self.counters["judge_calls"] += 1
+        self.counters["judged"] += len(items)
+        if error or not raw:
+            logger.warning(f"intent_router: 判断失败：{error or '没有返回内容'}")
+            return {}
+        verdicts = parse_judge_output(raw)
+        if not verdicts:
+            logger.warning(f"intent_router: 判断输出解析失败：{clip(raw, 120)}")
+            return {}
+        return verdicts
 
-    # ------------------------------------------------------------------
-    # LLM 调用与解析
-    # ------------------------------------------------------------------
     async def _call_judge(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        umo: str,
-    ) -> Optional[list[dict]]:
+        self, system_prompt: str, user_prompt: str, umo: str
+    ) -> tuple[str, str]:
+        """调用判断模型，返回 ``(原始文本, 错误说明)``。"""
+
         provider = None
-        if self.judge_provider_id:
-            provider = self.context.get_provider_by_id(self.judge_provider_id)
+        if self.settings.judge_provider_id:
+            try:
+                provider = self.context.get_provider_by_id(self.settings.judge_provider_id)
+            except Exception:
+                provider = None
             if provider is None:
                 logger.warning(
-                    f"intent_router: 未找到 judge_provider='{self.judge_provider_id}'，"
-                    "回退到会话默认 Provider"
+                    "intent_router: 找不到判断用的 Provider「%s」，改用会话默认",
+                    self.settings.judge_provider_id,
                 )
         if provider is None:
-            provider = await self.context.get_using_provider_async(umo)
-        if provider is None:
-            logger.error("intent_router: 没有可用 LLM Provider，无法判断")
-            return None
-
-        async with self._judge_semaphore:
-            resp = None
-            full_kwargs = {"temperature": self.temperature, "max_tokens": self.max_tokens}
-            if self.json_mode:
-                full_kwargs["response_format"] = {"type": "json_object"}
             try:
-                resp = await provider.text_chat(
-                    prompt=user_prompt,
-                    system_prompt=system_prompt,
-                    **full_kwargs,
+                provider = await self.context.get_using_provider_async(umo)
+            except Exception as exc:
+                return "", f"没有可用的判断模型：{exc}"
+        if provider is None:
+            return "", "没有可用的判断模型"
+
+        kwargs: dict[str, Any] = {
+            "temperature": max(0.0, min(0.3, float(self.settings.temperature))),
+            "max_tokens": int(self.settings.max_tokens),
+        }
+        if self.settings.json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        async with self._judge_semaphore:
+            try:
+                response = await provider.text_chat(
+                    prompt=user_prompt, system_prompt=system_prompt, **kwargs
                 )
-            except Exception as e1:
-                # 部分 Provider 不接受 temperature/max_tokens/response_format，降级重试
-                logger.debug(f"intent_router: 带参调用失败({e1})，降级为最小参数重试")
+            except Exception as exc:
+                logger.debug(f"intent_router: 带参调用失败（{exc}），退回最小参数重试")
                 try:
-                    resp = await provider.text_chat(
-                        prompt=user_prompt,
-                        system_prompt=system_prompt,
+                    response = await provider.text_chat(
+                        prompt=user_prompt, system_prompt=system_prompt
                     )
-                except Exception as e2:
-                    logger.error(f"intent_router: LLM 调用失败: {e2}")
-                    return None
-            if resp is None:
-                return None
-
-        self._record_usage(resp)
-        raw = getattr(resp, "completion_text", "") or ""
+                except Exception as retry_exc:
+                    return "", str(retry_exc)
+        if response is None:
+            return "", "判断模型没有返回内容"
+        self._record_usage(response)
+        raw = str(getattr(response, "completion_text", "") or "")
         if self.debug:
-            logger.info("intent_router 判断输出:\n%s", raw)
-        return self._parse_judge_output(raw)
+            logger.info("intent_router 判断输出：\n%s", raw)
+        return raw, ""
 
-    def _record_usage(self, resp: Any) -> None:
-        usage = getattr(resp, "usage", None)
+    def _record_usage(self, response: Any) -> None:
+        usage = getattr(response, "usage", None)
         if usage is None:
             return
-        s = self._stats
-        try:
-            s["prompt_tokens"] += int(getattr(usage, "input", 0) or 0)
-        except Exception:
-            pass
-        try:
-            s["completion_tokens"] += int(getattr(usage, "output", 0) or 0)
-        except Exception:
-            pass
-        try:
-            s["total_tokens"] += int(getattr(usage, "total", 0) or 0)
-        except Exception:
-            pass
-
-    def _parse_judge_output(self, raw: str) -> Optional[list[dict]]:
-        """解析 LLM 输出，返回 [{"idx","worth","confidence"}, ...]；失败返回 None。"""
-        if not raw or not raw.strip():
-            return None
-        text = raw.strip()
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-        text = re.sub(r"\s*```$", "", text)
-
-        results: list[dict] = []
-        parsed_ok = False
-        try:
-            data = json.loads(text)
-            if isinstance(data, list):
-                entries = data
-                parsed_ok = True
-            elif isinstance(data, dict) and isinstance(data.get("results"), list):
-                entries = data["results"]
-                parsed_ok = True
-            else:
-                entries = None
-            if parsed_ok:
-                # 空数组是合法结果：全部不值得回复
-                if not entries:
-                    return []
-                for e in entries:
-                    if not isinstance(e, dict):
-                        continue
-                    try:
-                        idx = int(e.get("idx"))
-                    except Exception:
-                        continue
-                    worth = e.get("worth")
-                    if worth is None:
-                        continue
-                    if isinstance(worth, str):
-                        worth = worth.strip().lower() in ("true", "1", "yes", "worth", "值得")
-                    else:
-                        worth = bool(worth)
-                    try:
-                        confidence = float(e.get("confidence", 1.0))
-                    except Exception:
-                        confidence = 1.0
-                    reason = e.get("reason")
-                    if reason is None:
-                        reason = ""
-                    else:
-                        reason = str(reason).strip()[:50]
-                    sender_name = e.get("from")
-                    if sender_name is None:
-                        sender_name = ""
-                    else:
-                        sender_name = str(sender_name).strip()[:30]
-                    to = e.get("to")
-                    if to is None:
-                        to = ""
-                    else:
-                        to = str(to).strip()[:30]
-                    directed = e.get("directed")
-                    if isinstance(directed, str):
-                        directed = directed.strip().lower() in (
-                            "true",
-                            "1",
-                            "yes",
-                            "是",
-                            "对",
-                        )
-                    else:
-                        directed = bool(directed)
-                    results.append(
-                        {
-                            "idx": idx,
-                            "worth": worth,
-                            "confidence": confidence,
-                            "reason": reason,
-                            "from": sender_name,
-                            "to": to,
-                            "directed": directed,
-                        }
-                    )
-                if results:
-                    return results
-                # 数组非空但没有任何有效条目：视为格式异常，走正则兜底
-        except Exception:
-            results = []
-
-        if not results:
-            # 正则兜底：输出中的数字视为"值得回复"的序号（如 [1,3]）
-            seen: set[int] = set()
-            for s in re.findall(r"\d+", text):
-                i = int(s)
-                if i > 0 and i not in seen:
-                    seen.add(i)
-                    results.append(
-                        {
-                            "idx": i,
-                            "worth": True,
-                            "confidence": 1.0,
-                            "reason": "",
-                            "from": "",
-                            "to": "",
-                            "directed": False,
-                        }
-                    )
-        return results or None
-
-    # ------------------------------------------------------------------
-    # Prompt 构建
-    # ------------------------------------------------------------------
-    def _build_system_prompt(self) -> str:
-        persona = self.bot_persona
-        prompt = self.judge_prompt or DEFAULT_JUDGE_PROMPT
-        if persona:
+        for key, attr in (
+            ("prompt_tokens", "input"),
+            ("completion_tokens", "output"),
+            ("total_tokens", "total"),
+        ):
             try:
-                prompt = prompt.format(persona=persona)
-            except (KeyError, IndexError, ValueError):
-                prompt = f"{prompt}\n\n机器人人设（简略）：{persona}"
-        return prompt + DIRECTED_RULES
+                self.counters[key] += int(getattr(usage, attr, 0) or 0)
+            except Exception:
+                continue
 
-    def _build_user_prompt(self, items: list[dict], history_lines: list[str]) -> str:
-        parts: list[str] = []
-        if history_lines:
-            parts.append("最近群聊背景（仅作参考，不属于待判断消息）：")
-            parts.extend(f"- {line}" for line in history_lines)
-            parts.append("")
-        parts.append("待判断消息列表：")
-        for i, it in enumerate(items, 1):
-            if it.get("reply_to"):
-                parts.append(f"{i}. {it['sender_name']} (回复 {it['reply_to']}): {it['text']}")
-            else:
-                parts.append(f"{i}. {it['sender_name']}: {it['text']}")
-        return "\n".join(parts)
+    # ==================================================================
+    # 小工具
+    # ==================================================================
 
-    def _build_history_lines(self, umo: str, items: list[dict]) -> list[str]:
-        if self.context_window <= 0:
-            return []
-        skip = {it["uuid"] for it in items}
-        lines = [
-            rec["line"]
-            for rec in self._history.get(umo, deque())
-            if rec["uuid"] not in skip
-        ]
-        return lines[-self.context_window :]
+    @staticmethod
+    def _sender_name(event: AstrMessageEvent) -> str:
+        name = str(event.get_sender_name() or "").strip()
+        return name or str(event.get_sender_id() or "未知用户")
 
-    def _history_append(self, event: AstrMessageEvent, text: str, item_uuid: str) -> None:
-        h = self._history.setdefault(
-            event.unified_msg_origin,
-            deque(maxlen=max(1, self.context_window)),
-        )
-        h.append(
-            {
-                "uuid": item_uuid,
-                "line": f"{self._sender_name(event)}: {text}",
-                "ts": time.time(),
-            }
-        )
+    @staticmethod
+    def _quoted_name(event: AstrMessageEvent) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        for component in list(getattr(message_obj, "message", []) or []):
+            if isinstance(component, Reply):
+                nick = str(getattr(component, "sender_nickname", "") or "").strip()
+                return nick or str(getattr(component, "sender_id", "") or "")
+        return ""
 
-    # ------------------------------------------------------------------
-    # 缓存
-    # ------------------------------------------------------------------
-    def _cache_get(self, key: tuple) -> Optional[dict]:
-        if not self.enable_cache:
-            return None
-        item = self._cache.get(key)
-        if not item:
-            return None
-        if time.time() - item["ts"] > self.cache_ttl:
-            self._cache.pop(key, None)
-            return None
-        return item
+    def _history_append(self, umo: str, text: str) -> None:
+        history = self._history.setdefault(umo, deque(maxlen=40))
+        history.append((time.time(), clip(text, 200)))
 
-    # ---------------- 与「虚拟世界」插件联动 ----------------
+    def _history_lines(self, umo: str) -> list[str]:
+        """最近群聊（给判断模型当局部上下文），按时间正序。"""
 
-    def _virtual_world_plugin(self):
-        """在同一个 AstrBot 进程里找到虚拟世界插件的实例。
-
-        找不到（没装 / 加载失败）时返回 None，调用方回落到固定阈值。
-        """
+        history = list(self._history.get(umo, []))[-max(0, self.settings.context_len) :]
+        return [f"{time.strftime('%H:%M', time.localtime(ts))} {text}" for ts, text in history]
+    def _virtual_world_plugin(self) -> Any:
+        """在同一个 AstrBot 进程里找「虚拟世界」插件实例（没装返回 None）。"""
 
         try:
             from astrbot.core.star.star import star_map
@@ -897,146 +868,193 @@ class IntentRouterPlugin(Star):
                 return getattr(meta, "star_cls", None)
         return None
 
-    async def _effective_threshold(self, umo: Optional[str]) -> float:
-        """放行阈值：装了虚拟世界插件时跟随她的孤独感动态变化。
+    # ==================================================================
+    # 看板用的 Web API
+    # ==================================================================
 
-        孤独感越高 → 阈值越低 → 更容易放行（她更想找人说话）。
-        会话没在白名单里、或读不到状态时，回落到配置里的固定阈值。
-        """
-
-        base = self.confidence_threshold
-        if not self.link_virtual_world or not umo:
-            return base
-
-        now = time.time()
-        cached = self._vw_threshold_cache.get(umo)
-        if cached and now - cached[0] < self.vw_cache_seconds:
-            return cached[1]
-
-        threshold = base
-        plugin = self._virtual_world_plugin()
-        if plugin is not None and hasattr(plugin, "social_snapshot"):
-            snapshot = None
-            try:
-                snapshot = await plugin.social_snapshot(umo)
-            except Exception as exc:
-                logger.debug(f"intent_router: 读取虚拟世界状态失败：{exc}")
-            if snapshot:
-                if snapshot.get("sleeping"):
-                    # 她在睡觉：不做任何放行判断（硬门）。阈值设成 1 以上，
-                    # 任何置信度都不可能通过——比"意愿为 0 时的最高阈值"更彻底。
-                    if not getattr(self, "_vw_sleep_logged", False):
-                        self._vw_sleep_logged = True
-                        logger.info(
-                            "intent_router: 检测到她在「虚拟世界」里睡觉，"
-                            "睡着期间不做放行判断"
-                        )
-                    self._vw_threshold_cache[umo] = (now, 1.01)
-                    return 1.01
-                # 优先用虚拟世界算好的「综合回复意愿」；拿不到就退回单看孤独感，
-                # 再拿不到就退回更老的 social 字段，保证版本不同步时也能工作。
-                raw = snapshot.get("willingness")
-                if raw is None:
-                    raw = snapshot.get("loneliness")
-                if raw is None:
-                    raw = snapshot.get("affect", snapshot.get("social"))
-                social = max(0.0, min(1.0, float(raw or 0.0)))
-                low = min(self.vw_threshold_min, self.vw_threshold_max)
-                high = max(self.vw_threshold_min, self.vw_threshold_max)
-                threshold = high - (high - low) * social
-                if not self._vw_link_logged:
-                    self._vw_link_logged = True
-                    logger.info(
-                        "intent_router: 检测到虚拟世界插件，放行阈值跟随她的综合回复意愿"
-                        f"（意愿 0 → {high:.2f}，意愿 1 → {low:.2f}）"
-                    )
-                if self.debug:
-                    logger.info(
-                        f"intent_router: 联动阈值 umo={umo} "
-                        f"willingness={social:.2f} -> {threshold:.2f}（基准 {base:.2f}）"
-                    )
-
-        self._vw_threshold_cache[umo] = (now, threshold)
-        if len(self._vw_threshold_cache) > 500:
-            self._vw_threshold_cache.clear()
-        return threshold
-
-    def _cache_set(self, key: tuple, worth: bool, confidence: float) -> None:
-        if not self.enable_cache:
+    def _register_web_apis(self) -> None:
+        if not self.settings.web_enabled or request is None:
             return
-        self._cache[key] = {
-            "worth": bool(worth),
-            "confidence": float(confidence),
-            "ts": time.time(),
+        register_api = getattr(self.context, "register_web_api", None)
+        if not callable(register_api):
+            return
+        register = register_api
+        p = PLUGIN_NAME
+        register(f"/{p}/status", self.api_status, ["GET"], "运行状态")
+        register(f"/{p}/stats", self.api_stats, ["GET"], "统计")
+        register(f"/{p}/judgements", self.api_judgements, ["GET"], "判定流水")
+        register(f"/{p}/feedback", self.api_feedback, ["POST"], "标记判定好坏")
+        register(f"/{p}/params", self.api_params, ["GET", "POST"], "核心参数")
+        register(f"/{p}/control", self.api_control, ["POST"], "开关")
+        register(f"/{p}/data", self.api_data, ["GET", "POST"], "导出 / 清空数据")
+
+    def _param_dict(self) -> dict[str, Any]:
+        return {
+            "base_p": self.tunable.base_p,
+            "hard_cap": self.tunable.hard_cap,
+            "rare_threshold": self.tunable.rare_threshold,
+            "confidence_threshold": self.tunable.confidence_threshold,
+            "willingness_floor": self.tunable.willingness_floor,
+            "reply_willingness_line": self.tunable.reply_willingness_line,
+            "penalty_base": self.tunable.penalty_base,
+            "load_penalty_floor": self.tunable.load_penalty_floor,
+            "load_penalty_slope": self.tunable.load_penalty_slope,
+            "silence_bonus_cap": self.tunable.silence_bonus_cap,
+            "half_life_short": self.tunable.half_life_short,
+            "half_life_mid": self.tunable.half_life_mid,
+            "half_life_long": self.tunable.half_life_long,
+            "mix_short": self.tunable.mix_short,
+            "mix_mid": self.tunable.mix_mid,
+            "mix_long": self.tunable.mix_long,
+            "breaker_short_count": self.tunable.breaker_short_count,
+            "breaker_short_window": self.tunable.breaker_short_window,
+            "breaker_mid_count": self.tunable.breaker_mid_count,
+            "breaker_mid_window": self.tunable.breaker_mid_window,
+            "breaker_long_count": self.tunable.breaker_long_count,
+            "breaker_long_window": self.tunable.breaker_long_window,
+            "reply_cooldown_seconds": self.tunable.reply_cooldown_seconds,
+            "reply_queue_delay": self.tunable.reply_queue_delay,
+            "proactive_enabled": self.tunable.proactive_enabled,
+            "willingness_default": self.tunable.willingness_default,
+            "vm_timeout": self.tunable.vm_timeout,
+            "vm_breaker_threshold": self.tunable.vm_breaker_threshold,
+            "vm_breaker_cooldown": self.tunable.vm_breaker_cooldown,
+            "keep_days": self.tunable.keep_days,
         }
-        self._prune_cache()
 
-    def _prune_cache(self) -> None:
-        if len(self._cache) <= self.cache_max_entries:
-            return
-        now = time.time()
-        expired = [k for k, v in self._cache.items() if now - v["ts"] > self.cache_ttl]
-        for k in expired:
-            self._cache.pop(k, None)
-        if len(self._cache) > self.cache_max_entries:
-            # 仍超限：清掉最旧的一半
-            ordered = sorted(self._cache.items(), key=lambda kv: kv[1]["ts"])
-            for k, _ in ordered[: len(ordered) // 2]:
-                self._cache.pop(k, None)
+    def _status_dict(self) -> dict[str, Any]:
+        try:
+            sessions = sorted(self.storage.counts_by_umo(time.time() - 7 * 86400))
+        except Exception:
+            sessions = []
+        return {
+            "enable": bool(self.enable),
+            "proactive_enabled": bool(self.tunable.proactive_enabled),
+            "judge_provider_id": self.settings.judge_provider_id,
+            "batch": {
+                "enabled": bool(self.settings.enable_batch),
+                "size": self.settings.batch_size,
+                "interval": self.settings.batch_interval,
+            },
+            "context_len": self.settings.context_len,
+            "groups": {
+                "whitelist": list(self.settings.whitelist),
+                "blacklist": list(self.settings.blacklist),
+            },
+            "aliases": list(self.settings.aliases),
+            "bot_name": self.settings.bot_name,
+            "persona_chars": len(self.settings.bot_persona or ""),
+            "vm_linked": self._virtual_world_plugin() is not None,
+            "willingness_provider": self.provider.status(),
+            "storage": self.storage.stats(),
+            "counters": dict(self.counters),
+            "cache_hits": self.cache.hits,
+            "buffered": {umo: len(buf) for umo, buf in self._buffers.items() if buf},
+            "sessions": sessions,
+        }
 
-    # ------------------------------------------------------------------
-    # 工具
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _clean_text(s: str) -> str:
-        if not isinstance(s, str):
-            return ""
-        s = re.sub(r"\[At:[^\]]+\]", "", s)
-        s = re.sub(r"<at[^>]*>.*?</at>", "", s, flags=re.I | re.S)
-        s = re.sub(r"\s+", " ", s)
-        return s.strip()
+    async def api_status(self):
+        return json_response(self._status_dict())
 
-    @staticmethod
-    def _sender_name(event: AstrMessageEvent) -> str:
-        name = event.get_sender_name() or ""
-        if name.strip():
-            return name.strip()
-        return str(event.get_sender_id() or "未知用户")
+    async def api_stats(self):
+        umo = str(request.query.get("session", "") or "")
+        try:
+            window = float(request.query.get("window", 604800) or 604800)
+        except (TypeError, ValueError):
+            window = 604800
+        try:
+            limit = int(request.query.get("limit", 50) or 50)
+        except (TypeError, ValueError):
+            limit = 50
+        report = build_report(
+            storage=self.storage,
+            provider_status=self.provider.status(),
+            counters=self.counters,
+            tunable=self.tunable,
+            umo=umo,
+            window_seconds=window,
+            recent_limit=max(1, min(200, limit)),
+        )
+        return json_response(report)
 
-    # ------------------------------------------------------------------
-    # 生命周期
-    # ------------------------------------------------------------------
-    async def initialize(self) -> None:
-        self._flush_task = asyncio.create_task(self._flush_loop())
-        if self.link_virtual_world:
-            world = self._virtual_world_plugin()
-            if world is not None and hasattr(world, "social_snapshot"):
-                logger.info(
-                    "intent_router: 检测到「虚拟世界」插件，放行阈值将跟随她的社交欲"
-                    f"（社交欲 0 → {max(self.vw_threshold_min, self.vw_threshold_max):.2f}，"
-                    f"社交欲 1 → {min(self.vw_threshold_min, self.vw_threshold_max):.2f}）"
-                )
+    async def api_judgements(self):
+        umo = str(request.query.get("session", "") or "")
+        try:
+            limit = int(request.query.get("limit", 50) or 50)
+        except (TypeError, ValueError):
+            limit = 50
+        rows = self.storage.recent_judgements(umo=umo, limit=max(1, min(500, limit)))
+        return json_response({"judgements": rows})
+
+    async def api_feedback(self):
+        payload = await request.json(default={}) or {}
+        try:
+            judgement_id = int(payload.get("id"))
+        except (TypeError, ValueError):
+            return error_response("缺少判定 id")
+        value = str(payload.get("value") or "")
+        if value not in ("good", "bad", ""):
+            return error_response("value 只能是 good / bad / 空")
+        ok = self.storage.set_feedback(judgement_id, value)
+        return json_response({"ok": bool(ok)})
+
+    async def api_params(self):
+        if request.method == "POST" or str(request.query.get("_method", "")).upper() == "POST":
+            payload = await request.json(default={}) or {}
+            if payload.get("reset"):
+                self.tunable = self.overrides.reset()
             else:
-                logger.info(
-                    "intent_router: 已开启「虚拟世界」联动，但启动时还没看到它"
-                    "（插件加载顺序可能晚于本插件），运行中会自动重试；"
-                    "确实没装时沿用固定阈值"
-                )
-        logger.info(
-            "intent_router 已初始化：batch=%s(%d条/%ds) judge_provider=%s 人设=%s",
-            "开" if self.enable_batch else "关",
-            self.batch_size,
-            self.batch_interval,
-            self.judge_provider_id or "(会话默认)",
-            self.bot_persona,
+                incoming = payload.get("params")
+                if not isinstance(incoming, dict):
+                    return error_response("params 必须是对象")
+                merged = {**self._param_dict(), **incoming}
+                self.tunable = self.overrides.save(Tunable(**merged))
+            self.registry.set_tunable(self.tunable)
+            self.provider.set_tunable(self.tunable)
+            logger.info("intent_router: 看板更新了核心参数")
+            return json_response({"ok": True, "params": self._param_dict()})
+        return json_response({"params": self._param_dict()})
+
+    async def api_control(self):
+        payload = await request.json(default={}) or {}
+        changed: list[str] = []
+        if "enable" in payload:
+            self.enable = bool(payload.get("enable"))
+            self.runtime.save({"enable": self.enable})
+            changed.append(f"插件已{'开启' if self.enable else '关闭'}")
+        if "proactive_enabled" in payload:
+            self.tunable = self.overrides.save(
+                Tunable(**{**self._param_dict(), "proactive_enabled": bool(payload.get("proactive_enabled"))})
+            )
+            self.registry.set_tunable(self.tunable)
+            self.provider.set_tunable(self.tunable)
+            changed.append(
+                f"主动插嘴已{'开启' if self.tunable.proactive_enabled else '关闭'}"
+            )
+        return json_response(
+            {"ok": True, "changed": changed, "enable": self.enable, "status": self._status_dict()}
         )
 
-    async def terminate(self) -> None:
-        if self._flush_task:
-            self._flush_task.cancel()
-            try:
-                await asyncio.wait_for(self._flush_task, timeout=5)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-            self._flush_task = None
-        logger.info(f"intent_router 已卸载，统计: {self._stats}")
+    async def api_data(self):
+        if request.method == "POST" or str(request.query.get("_method", "")).upper() == "POST":
+            payload = await request.json(default={}) or {}
+            if payload.get("clear"):
+                tables = payload.get("tables") or ["speech", "judgement"]
+                self.storage.clear(tuple(str(item) for item in tables))
+                self.cache.clear()
+                return json_response({"ok": True})
+            if payload.get("prune"):
+                removed = self.storage.prune(self.tunable.keep_days)
+                return json_response({"ok": True, "removed": removed})
+            return error_response("没什么可做的")
+        umo = str(request.query.get("session", "") or "")
+        rows = self.storage.recent_judgements(umo=umo, limit=5000)
+        speech = self.storage.speech_since(umo, 0.0) if umo else []
+        return json_response(
+            {
+                "exported_at": time.time(),
+                "params": self._param_dict(),
+                "judgements": rows,
+                "speech_count": len(speech),
+            }
+        )
