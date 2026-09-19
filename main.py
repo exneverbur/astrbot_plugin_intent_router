@@ -75,6 +75,8 @@ LLM_HOOK_PRIORITY = 90
 REINJECT_EXTRA = "intent_router_reinject"
 PROACTIVE_EXTRA = "intent_router_proactive"
 DATA_DIR_ENV = "INTENT_ROUTER_DATA_DIR"
+# 合并放行时，最多把同一批里更早的几句折成背景带上（最新的那几条）
+BURST_LEAD_LINES = 6
 
 PROACTIVE_HINT = (
     "\n\n【这一条是偶尔插一句】\n"
@@ -102,7 +104,7 @@ def _resolve_data_dir(plugin_dir: str) -> str:
     PLUGIN_NAME,
     "exneverbur",
     "智能意图路由：判断群里的消息值不值得让主人格开口回复",
-    "v2.0.0",
+    "v2.1",
 )
 class IntentRouterPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -143,6 +145,8 @@ class IntentRouterPlugin(Star):
         self._buffer_lock = asyncio.Lock()
         self._history: dict[str, deque] = {}
         self._deadlines: dict[str, float] = {}
+        # 每个会话上一次「真的开口」的时刻（含排队延迟），用来算最小间隔
+        self._last_release: dict[str, float] = {}
         self._judge_semaphore = asyncio.Semaphore(self.settings.concurrency)
         self._flush_task: Optional[asyncio.Task] = None
         self._delayed: set[asyncio.Task] = set()
@@ -155,6 +159,7 @@ class IntentRouterPlugin(Star):
             "judge_calls": 0,
             "released": 0,
             "delayed": 0,
+            "merged": 0,
             "blocked": 0,
             "proactive": 0,
             "safety_blocked": 0,
@@ -500,12 +505,17 @@ class IntentRouterPlugin(Star):
             self.counters["judge_failed"] += 1
             if self.settings.failure_policy == "pass":
                 if deferred:
-                    self._release(items)
+                    self._release_batch(
+                        [{"item": item, "delay": 0.0, "judgement": 0} for item in items],
+                        items,
+                        umo,
+                    )
             else:
                 self.counters["blocked"] += len(items)
                 for item in items:
                     self._block_event(item["event"])
             return
+        ready: list[dict[str, Any]] = []
         for index, item in enumerate(items, start=1):
             verdict = verdicts.get(index)
             if verdict is None:
@@ -515,13 +525,20 @@ class IntentRouterPlugin(Star):
                 self._block_event(item["event"])
                 continue
             self.cache.set(item["key"], verdict, time.time())
-            await self._apply_decision(
+            release = await self._apply_decision(
                 event=item["event"],
                 umo=umo,
                 text=item["text"],
                 verdict=verdict,
                 deferred=deferred,
             )
+            if release is not None:
+                ready.append(
+                    {"item": item, "delay": release[0], "judgement": release[1]}
+                )
+        # 放行统一放在批处理这一层：一批里每条各自放行的话，她一句话就会回一屏
+        if deferred and ready:
+            self._release_batch(ready, items, umo)
 
     async def _apply_decision(
         self,
@@ -532,8 +549,13 @@ class IntentRouterPlugin(Star):
         verdict: Verdict,
         cached: bool = False,
         deferred: bool = True,
-    ) -> None:
-        """把一条判断落成"回 / 插一句 / 不回"，并写进流水。"""
+    ) -> Optional[tuple[float, int]]:
+        """把一条判断落成"回 / 插一句 / 不回"，并写进流水。
+
+        返回值：``None`` = 不回；``(延迟秒数, 流水 id)`` = 该放行。
+        放行本身交给调用方（见 :meth:`_release_batch`）：一批里每条各自放行的话，
+        她一句话就会回一屏。
+        """
 
         now = time.time()
         snapshot = self.registry.snapshot(umo, now)
@@ -543,7 +565,7 @@ class IntentRouterPlugin(Star):
             # 她在睡觉：静默，连记录都不用（睡眠门禁在 VM 那边也有，这里再挡一道）
             self.counters["blocked"] += 1
             self._block_event(event)
-            return
+            return None
 
         safety = self.safety.check(text, risk=verdict.risk)
         if safety.blocked:
@@ -559,7 +581,7 @@ class IntentRouterPlugin(Star):
                 willing=willing.value,
                 snapshot=snapshot,
             )
-            return
+            return None
 
         if verdict.worth:
             outcome = decide_reply(
@@ -568,7 +590,7 @@ class IntentRouterPlugin(Star):
                 density=snapshot.as_density(),
                 tunable=self.tunable,
             )
-            self._persist(
+            judgement = self._persist(
                 umo=umo,
                 text=text,
                 verdict=verdict,
@@ -578,12 +600,6 @@ class IntentRouterPlugin(Star):
                 willing=willing.value,
                 snapshot=snapshot,
             )
-            if outcome.delay > 0:
-                if deferred:
-                    self._schedule_release(event, outcome.delay)
-                self.counters["delayed"] += 1
-            elif deferred:
-                self._release([{"event": event}])
             if self.debug:
                 logger.info(
                     "intent_router 放行：%s（worth=%s score=%.2f 意愿=%.2f %s）",
@@ -593,7 +609,7 @@ class IntentRouterPlugin(Star):
                     willing.value,
                     "缓存" if cached else "",
                 )
-            return
+            return (float(outcome.delay or 0.0), judgement)
 
         outcome = decide_proactive(
             verdict,
@@ -602,7 +618,7 @@ class IntentRouterPlugin(Star):
             counts=snapshot.counts,
             tunable=self.tunable,
         )
-        self._persist(
+        judgement = self._persist(
             umo=umo,
             text=text,
             verdict=verdict,
@@ -623,9 +639,7 @@ class IntentRouterPlugin(Star):
                 outcome.probability,
                 clip(text, 40),
             )
-            if deferred:
-                self._release([{"event": event}])
-            return
+            return (0.0, judgement)
         self.counters["blocked"] += 1
         self._block_event(event)
         if self.debug:
@@ -636,6 +650,7 @@ class IntentRouterPlugin(Star):
                 verdict.confidence,
                 outcome.reason,
             )
+        return None
 
     def _persist(
         self,
@@ -648,9 +663,11 @@ class IntentRouterPlugin(Star):
         reason: str,
         willing: float,
         snapshot: Any,
-    ) -> None:
+    ) -> int:
+        """写一条判定流水，返回它的 id（看板上就是那一行的编号）。"""
+
         try:
-            self.storage.record_judgement(
+            return self.storage.record_judgement(
                 umo=umo,
                 ts=time.time(),
                 sender=verdict.sender,
@@ -673,18 +690,97 @@ class IntentRouterPlugin(Star):
             )
         except Exception as exc:
             logger.debug(f"intent_router: 写判定流水失败：{exc}")
+            return 0
 
     # ==================================================================
     # 放行 / 排队 / 重注入
     # ==================================================================
 
-    def _schedule_release(self, event: AstrMessageEvent, delay: float) -> None:
-        """意愿偏低时排队延迟一会儿再放行（而不是直接拒绝）。"""
+    def _release_batch(
+        self, ready: list[dict[str, Any]], items: list[dict[str, Any]], umo: str
+    ) -> None:
+        """一批里被判"该回"的那些：决定真正放行几条。
+
+        ``latest``（默认）只放行最新那条，同一批里更早的几句折成一段背景带上——
+        让她一次把这波话回完，而不是一条消息回一句。``all`` 保持每条各自放行。
+        """
+
+        if not ready:
+            return
+        ordered = sorted(ready, key=lambda entry: int(entry["item"].get("seq") or 0))
+        if self.settings.release_policy == "latest":
+            picked = [ordered[-1]]
+            for entry in ordered[:-1]:
+                self.counters["merged"] += 1
+                self._mark_merged(entry.get("judgement"))
+            picked[0]["lead"] = self._burst_lead(items, picked[0]["item"])
+        else:
+            picked = ordered
+        for entry in picked:
+            self._release_entry(entry, umo)
+
+    def _release_entry(self, entry: dict[str, Any], umo: str) -> None:
+        """把一条放回管道：该等就等（意愿排队 + 会话最小间隔），到点再重注入。"""
+
+        delay = max(0.0, float(entry.get("delay") or 0.0))
+        cooldown = self._cooldown_wait(umo)
+        if cooldown > delay:
+            delay = cooldown
+        if delay > 0:
+            self.counters["delayed"] += 1
+            self._schedule_release(
+                entry["item"]["event"], delay, lead=str(entry.get("lead") or "")
+            )
+        else:
+            self._release_now(entry["item"]["event"], str(entry.get("lead") or ""))
+        # 记的是"真的发出去"的时刻，后面几条都按它算间隔
+        self._last_release[umo] = time.time() + delay
+
+    def _cooldown_wait(self, umo: str) -> float:
+        """离上次开口还差多久：同一条会话里两次放行至少隔这么久。"""
+
+        last = float(self._last_release.get(umo, 0.0))
+        if not last:
+            return 0.0
+        return max(0.0, last + float(self.tunable.reply_cooldown_seconds) - time.time())
+
+    def _burst_lead(self, items: list[dict[str, Any]], chosen: dict[str, Any]) -> str:
+        """同一批里比它更早的那几句，折成一小段背景带上。
+
+        这些消息早被打回了，主人格本来只看得见最后一条；带上背景她才接得上话。
+        """
+
+        chosen_seq = int(chosen.get("seq") or 0)
+        lines = [
+            f"{str(item.get('sender') or '有人')}：{clip(str(item.get('text') or ''), 60)}"
+            for item in items
+            if int(item.get("seq") or 0) < chosen_seq and str(item.get("text") or "").strip()
+        ]
+        if not lines:
+            return ""
+        lines = lines[-BURST_LEAD_LINES:]
+        body = "\n".join(f"- {line}" for line in lines)
+        return f"[群里连着发的几条]\n{body}\n"
+
+    def _mark_merged(self, judgement: Any) -> None:
+        """被合并掉的那几条：在流水里补一句，免得看板上看着像回了好几次。"""
+
+        try:
+            judgement_id = int(judgement or 0)
+        except (TypeError, ValueError):
+            return
+        if judgement_id:
+            self.storage.mark_merged(judgement_id, "；同一批里被合并成一次回复")
+
+    def _schedule_release(
+        self, event: AstrMessageEvent, delay: float, *, lead: str = ""
+    ) -> None:
+        """排队延迟一会儿再放行（而不是直接拒绝）。"""
 
         async def later() -> None:
             try:
                 await asyncio.sleep(max(0.0, delay))
-                self._release([{"event": event}])
+                self._release_now(event, lead)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -694,22 +790,15 @@ class IntentRouterPlugin(Star):
         self._delayed.add(task)
         task.add_done_callback(self._delayed.discard)
 
-    def _release(self, items: list[dict[str, Any]]) -> None:
-        """把值得回的消息放回去走正常管道（带上 @ 唤醒标记）。"""
+    def _release_now(self, event: AstrMessageEvent, lead: str = "") -> None:
+        self._reinject(event, lead=lead)
+        self.counters["released"] += 1
 
-        if not items:
-            return
-        if self.settings.release_policy == "latest":
-            ordered = sorted(items, key=lambda it: it.get("seq", 0), reverse=True)
-            self._reinject(ordered[0]["event"])
-            self.counters["released"] += 1
-            return
-        for item in items:
-            self._reinject(item["event"])
-            self.counters["released"] += 1
+    def _reinject(self, event: AstrMessageEvent, *, lead: str = "") -> None:
+        """把消息副本（带 At 唤醒标记）放回事件队列，重新走一遍管道。
 
-    def _reinject(self, event: AstrMessageEvent) -> None:
-        """把消息副本（带 At 唤醒标记）放回事件队列，重新走一遍管道。"""
+        ``lead`` 是这一批里更早的几句（见 :meth:`_burst_lead`），拼在正文前面。
+        """
 
         try:
             new_event = copy.copy(event)
@@ -730,6 +819,10 @@ class IntentRouterPlugin(Star):
                 )
                 if not has_at_self:
                     chain.insert(0, At(qq=self_id, name=self_id))
+            if lead:
+                body = str(new_event.message_str or "").strip()
+                head = str(lead).strip()
+                new_event.message_str = f"{head}\n{body}".strip()
             new_event.set_extra(REINJECT_EXTRA, True)
             self.context.get_event_queue().put_nowait(new_event)
         except Exception as exc:

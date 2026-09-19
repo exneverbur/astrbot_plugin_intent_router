@@ -17,6 +17,8 @@ PROACTIVE = "proactive"
 IGNORE = "ignore"
 BLOCKED = "blocked"
 SAFETY = "safety"
+MERGED = "merged"
+"""判定值得回，但同一批里已经有一条在回她了：这条并进那一次，不单独开口。"""
 
 
 @dataclass

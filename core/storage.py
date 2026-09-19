@@ -124,6 +124,26 @@ class Storage:
             self._conn.commit()
             return bool(cursor.rowcount)
 
+    def mark_merged(self, judgement_id: int, note: str) -> bool:
+        """改写这一行的最终去向：同一批里并进了别人的那次开口，没有单独回。
+
+        决策改成 ``merged``、理由后面补一句——不然看板上的流水会显示她回了一屏。
+        """
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT reason FROM judgement WHERE id = ?", (int(judgement_id),)
+            ).fetchone()
+            if row is None:
+                return False
+            reason = f"{str(row['reason'] or '').rstrip('；')}{note}"[:200]
+            cursor = self._conn.execute(
+                "UPDATE judgement SET decision = ?, reason = ? WHERE id = ?",
+                ("merged", reason, int(judgement_id)),
+            )
+            self._conn.commit()
+            return bool(cursor.rowcount)
+
     # ---------------- 读 ----------------
 
     def speech_since(self, umo: str, since: float, limit: int = 5000) -> list[dict[str, Any]]:

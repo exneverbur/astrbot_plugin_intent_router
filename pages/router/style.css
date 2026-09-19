@@ -184,6 +184,11 @@ h2 {
   color: var(--muted);
 }
 
+.tag.merged {
+  color: var(--accent, var(--muted));
+  border-color: rgba(120, 140, 200, 0.5);
+}
+
 .params {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));

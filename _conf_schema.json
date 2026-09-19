@@ -125,7 +125,7 @@
   },
   "release": {
     "description": "一批里放行几条",
-    "hint": "latest = 只放行最新那条；all = 全部放行。默认 latest。",
+    "hint": "latest = 一批里只放行最新那条，更早的几句折成背景带上；all = 每条各自放行。默认 latest。",
     "type": "string",
     "default": "latest"
   },

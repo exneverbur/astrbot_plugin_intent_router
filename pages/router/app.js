@@ -27,6 +27,7 @@ const PARAMS = [
   ["breaker_mid_count", "熔断：近 1 小时上限", "默认 5 次"],
   ["breaker_long_count", "熔断：近 24 小时上限", "默认 12 次"],
   ["reply_queue_delay", "低意愿排队延迟（秒）", "默认 30"],
+  ["reply_cooldown_seconds", "两次开口的最小间隔（秒）", "距上一次放行至少隔这么久，默认 60"],
   ["willingness_default", "没装 VM 时的固定意愿", "默认 0.55"],
   ["vm_timeout", "VM 超时（秒）", "默认 0.5"],
   ["vm_breaker_threshold", "VM 连续失败几次熔断", "默认 5"],
@@ -107,6 +108,7 @@ function renderCards(report) {
   const counters = report.counters || {};
   box.appendChild(metric("判断条数", counts.judged || 0, `窗口 ${Math.round((report.window_seconds || 0) / 86400)} 天`));
   box.appendChild(metric("放行回复", byDecision.reply || 0, "worth=true 正常放行"));
+  box.appendChild(metric("合并未单独回", byDecision.merged || 0, "同一批里并进上面那次"));
   box.appendChild(metric("主动插嘴", byDecision.proactive || 0, `候选 ${proactive.candidates || 0} 条`));
   box.appendChild(metric("熔断/不回", `${byDecision.blocked || 0} / ${byDecision.ignore || 0}`));
   box.appendChild(metric("判断调用", counters.judge_calls || 0, `失败 ${counters.judge_failed || 0}`));

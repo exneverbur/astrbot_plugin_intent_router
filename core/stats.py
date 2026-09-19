@@ -5,9 +5,9 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from .decision import BLOCKED, IGNORE, PROACTIVE, REPLY
+from .decision import BLOCKED, IGNORE, MERGED, PROACTIVE, REPLY
 
-DECISIONS = (REPLY, PROACTIVE, BLOCKED, IGNORE)
+DECISIONS = (REPLY, MERGED, PROACTIVE, BLOCKED, IGNORE)
 BUCKETS = ((0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0001))
 
 

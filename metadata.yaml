@@ -1,6 +1,6 @@
 name: astrbot_plugin_intent_router
 display_name: 智能意图路由
 desc: 用低成本 LLM 判断群聊消息值不值得让主人格开口：结构化打分、时间衰减密度、主动插嘴熔断、与虚拟世界插件联动，带网页看板
-version: v2.0.0
+version: v2.1
 author: exneverbur
 repo: https://github.com/exneverbur/astrbot_plugin_intent_router
