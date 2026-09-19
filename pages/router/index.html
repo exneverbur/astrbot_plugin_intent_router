@@ -82,10 +82,14 @@
       <section class="card">
         <h2>核心参数</h2>
         <p class="muted">
-          改完点保存立刻生效，不用回 AstrBot 面板重载插件。参数存成
-          <code>overrides.json</code>；想回到默认点「恢复默认」。
+          每个参数后面的 <b>?</b> 上停一下（或按 Tab 聚焦）就有说明：它管什么、调大调小会怎样。
+          改完点保存立刻生效，不用回 AstrBot 面板重载插件；参数存成
+          <code>overrides.json</code>，想回到默认点「恢复默认」。
         </p>
-        <div id="params-form" class="params"></div>
+        <p class="muted">
+          攒批的「几条 / 最长等多少秒 / 自适应」在 AstrBot 的插件配置里改（当前值见页面顶部那行状态）。
+        </p>
+        <div id="params-form"></div>
         <div class="row">
           <button id="params-save" class="primary">保存参数</button>
           <button id="params-reset" class="ghost">恢复默认</button>

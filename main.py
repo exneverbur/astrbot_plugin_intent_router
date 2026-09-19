@@ -432,17 +432,31 @@ class IntentRouterPlugin(Star):
         was_empty = not buf
         buf.append(item)
         if was_empty:
-            self._deadlines[umo] = item["ts"] + random.uniform(
-                min(5.0, self.settings.batch_interval), self.settings.batch_interval
-            )
-        else:
+            self._deadlines[umo] = item["ts"] + self._first_wait()
+        elif self.settings.adaptive:
+            # 群里还在说就往后挪一点，最多挪到首条入队 + batch_interval
+            grew = self._deadlines.get(
+                umo, buf[0]["ts"] + float(self.settings.interval_min)
+            ) + random.uniform(0.0, max(0.0, float(self.settings.interval_step)))
             self._deadlines[umo] = min(
-                self._deadlines.get(umo, item["ts"]),
-                buf[0]["ts"] + self.settings.batch_interval,
+                grew, buf[0]["ts"] + float(self.settings.batch_interval)
             )
         while len(buf) > 100:
             buf.popleft()
             self.counters["dropped_overflow"] += 1
+
+    def _first_wait(self) -> float:
+        """首条消息进队后等多久：自适应时 interval_min ~ 2×interval_min，固定时整个 batch_interval。
+
+        自适应让冷群（只有一两条）等得短、火热群随消息往后挪，最多挪到 batch_interval。
+        """
+
+        span = max(0.0, float(self.settings.batch_interval))
+        if not self.settings.adaptive:
+            return span
+        low = min(max(0.0, float(self.settings.interval_min)), span)
+        high = min(max(low, low * 2.0), span)
+        return random.uniform(low, high)
 
     async def _flush_loop(self) -> None:
         while True:
@@ -1028,6 +1042,11 @@ class IntentRouterPlugin(Star):
                 "enabled": bool(self.settings.enable_batch),
                 "size": self.settings.batch_size,
                 "interval": self.settings.batch_interval,
+                "adaptive": bool(self.settings.adaptive),
+                "interval_min": self.settings.interval_min,
+                "interval_step": self.settings.interval_step,
+                "buffer_seconds": self.settings.buffer_seconds,
+                "release_policy": self.settings.release_policy,
             },
             "context_len": self.settings.context_len,
             "groups": {

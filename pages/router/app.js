@@ -6,33 +6,143 @@
 
 const bridge = window.AstrBotPluginPage;
 
-const PARAMS = [
-  ["base_p", "主动插嘴基础概率", "每条「好梗」的起始概率，默认 0.02"],
-  ["hard_cap", "主动插嘴概率上限", "再怎么算也不会超过这个概率，默认 0.08"],
-  ["rare_threshold", "好梗门槛", "rare_interject_score 低于它就完全不考虑插嘴，默认 0.85"],
-  ["confidence_threshold", "把握门槛", "模型自信度低于它就不插嘴，默认 0.90"],
-  ["willingness_floor", "意愿熔断线", "她意愿低于它时直接不插嘴，默认 0.20"],
-  ["reply_willingness_line", "意愿降级线", "低于它就不秒回、排队延迟，默认 0.10"],
-  ["penalty_base", "密度惩罚底数", "0.5 表示每加权一次发言折半，默认 0.5"],
-  ["load_penalty_floor", "密度惩罚下限", "再密也不会低于这个值，默认 0.20"],
-  ["load_penalty_slope", "密度惩罚斜率", "bot 发言占比放大倍数，默认 2.0"],
-  ["silence_bonus_cap", "沉默补偿上限", "太久没说话给的一点加成，默认 0.10"],
-  ["half_life_short", "短半衰期（分钟）", "默认 5"],
-  ["half_life_mid", "中半衰期（分钟）", "默认 30"],
-  ["half_life_long", "长半衰期（分钟）", "默认 360"],
-  ["mix_short", "短尺度权重", "默认 0.50"],
-  ["mix_mid", "中尺度权重", "默认 0.30"],
-  ["mix_long", "长尺度权重", "默认 0.20"],
-  ["breaker_short_count", "熔断：近 10 分钟上限", "默认 2 次"],
-  ["breaker_mid_count", "熔断：近 1 小时上限", "默认 5 次"],
-  ["breaker_long_count", "熔断：近 24 小时上限", "默认 12 次"],
-  ["reply_queue_delay", "低意愿排队延迟（秒）", "默认 30"],
-  ["reply_cooldown_seconds", "两次开口的最小间隔（秒）", "距上一次放行至少隔这么久，默认 60"],
-  ["willingness_default", "没装 VM 时的固定意愿", "默认 0.55"],
-  ["vm_timeout", "VM 超时（秒）", "默认 0.5"],
-  ["vm_breaker_threshold", "VM 连续失败几次熔断", "默认 5"],
-  ["vm_breaker_cooldown", "VM 熔断时长（秒）", "默认 60"],
-  ["keep_days", "记录保留天数", "默认 30"],
+/** 核心参数：按用途分组，每项都有悬停说明（label 后面的 ? 上停一下）。 */
+const PARAM_GROUPS = [
+  {
+    title: "正常回复",
+    hint: "她在群里接话的那条路——判断模型说「值得回」时走这里。",
+    items: [
+      [
+        "reply_willingness_line",
+        "意愿降级线",
+        "她的意愿低于这个值时，不拒绝，只改成「排队等一会儿再回」。默认 0.10。\n" +
+          "调高：更容易出现慢半拍的回复；调低：意愿低时也秒回。",
+      ],
+      [
+        "reply_queue_delay",
+        "低意愿排队延迟（秒）",
+        "意愿低于上面那条线时，先压这么久再放行（一轮里多条被合并时，也算这里）。默认 30。\n" +
+          "调大：更像「懒得马上回」，但话题可能已经过去了。",
+      ],
+      [
+        "reply_cooldown_seconds",
+        "两次开口的最小间隔（秒）",
+        "同一条会话里，距上一次真的开口至少隔这么久，下一波消息要排到间隔之后再放行。默认 60。\n" +
+          "调大：群里刷屏时她更不容易连着回；调 0：不限制。",
+      ],
+    ],
+  },
+  {
+    title: "主动插嘴",
+    hint: "完全没在跟她说话、但确实是个好梗时才考虑。概率故意做得很低，插嘴多了会很吵。",
+    items: [
+      [
+        "base_p",
+        "插嘴基础概率",
+        "每条「好梗」消息的起始插嘴概率。默认 0.02（2%）。\n" +
+          "想让她更爱插话就把它和下面的上限一起调大。",
+      ],
+      [
+        "hard_cap",
+        "插嘴概率上限",
+        "算法算出来的概率再高也不会超过这个值（还会被密度和熔断继续压）。默认 0.08。",
+      ],
+      [
+        "rare_threshold",
+        "好梗门槛",
+        "判断模型给这条消息的「这梗值不值得插一句」分数（0~1）低于它就放弃。默认 0.85。\n" +
+          "调低：更容易被逗得插话。",
+      ],
+      [
+        "confidence_threshold",
+        "把握门槛",
+        "模型对自己判断的自信度低于它就不插嘴。默认 0.90。调低：允许她凭直觉插话。",
+      ],
+      [
+        "willingness_floor",
+        "意愿熔断线",
+        "她的意愿低于它时插嘴直接归零（只影响插嘴，正常回复不受影响）。默认 0.20。",
+      ],
+    ],
+  },
+  {
+    title: "密度惩罚",
+    hint: "她自己最近说得多不多。这是一段乘在概率上的系数：说得越密，概率越低。",
+    items: [
+      [
+        "penalty_base",
+        "密度惩罚底数",
+        "每多一份「最近说过话」的加权量，概率就乘一次这个数。默认 0.5：说一次折半。\n" +
+          "调小：她收敛得更快、更安静。",
+      ],
+      [
+        "load_penalty_floor",
+        "密度惩罚下限",
+        "上面那套惩罚最多把她压到这么低，不会压到 0。默认 0.20。调小：话密时更安静。",
+      ],
+      [
+        "load_penalty_slope",
+        "群活跃度斜率",
+        "拿群本身的热闹程度当分母：群里本来就话多，她同样的发言量罚得就轻。默认 2.0。\n" +
+          "调大：越热闹越不罚（冷群里她更安静）。",
+      ],
+      [
+        "silence_bonus_cap",
+        "沉默补偿上限",
+        "很久没开口时，给插嘴概率加一点补偿，最多加这个比例。默认 0.10（+10%）。",
+      ],
+    ],
+  },
+  {
+    title: "时间衰减",
+    hint: "「最近」到底算多久：把她的发言按离现在的时间折成权重，越近越重。半衰期 = 过了这么久权重剩一半。",
+    items: [
+      ["half_life_short", "短半衰期（分钟）", "默认 5：5 分钟前的发言权重只剩一半。"],
+      ["half_life_mid", "中半衰期（分钟）", "默认 30。"],
+      ["half_life_long", "长半衰期（分钟）", "默认 360（6 小时）。调小：只有刚说的话才算数。"],
+      [
+        "mix_short",
+        "短尺度权重",
+        "三档衰减按这个比例混合，三个数不必加起来等于 1（会自己归一化）。默认 0.50。",
+      ],
+      ["mix_mid", "中尺度权重", "默认 0.30。"],
+      ["mix_long", "长尺度权重", "默认 0.20。想让「刚刚说过」更管用，就把短的调大。"],
+    ],
+  },
+  {
+    title: "硬熔断",
+    hint: "硬性次数上限：在窗口内开口次数到顶就完全不再说话。只挡主动插嘴，别人 @ 她照常回。",
+    items: [
+      ["breaker_short_count", "熔断：短时间内上限（次）", "默认 2 次。填 0 = 关掉这档。"],
+      ["breaker_short_window", "熔断窗口：短（秒）", "上面那档统计多久之内。默认 600 秒（10 分钟）。"],
+      ["breaker_mid_count", "熔断：中等时间上限（次）", "默认 5 次。填 0 = 关掉这档。"],
+      ["breaker_mid_window", "熔断窗口：中（秒）", "默认 3600 秒（1 小时）。"],
+      ["breaker_long_count", "熔断：长时间上限（次）", "默认 12 次。填 0 = 关掉这档。"],
+      ["breaker_long_window", "熔断窗口：长（秒）", "默认 86400 秒（24 小时）。"],
+    ],
+  },
+  {
+    title: "与虚拟世界的联动",
+    hint: "意愿值就是「她现在想不想说话」。装了「虚拟世界」就用她的真实状态，没装就用固定值。",
+    items: [
+      ["willingness_default", "固定意愿（没装虚拟世界时）", "默认 0.55。0 = 完全不想说，1 = 很想说。"],
+      ["vm_timeout", "读意愿超时（秒）", "从虚拟世界取意愿最多等这么久，超时先用固定值顶上，不会卡住消息。默认 0.5。"],
+      ["vm_breaker_threshold", "连续失败几次熔断", "连续失败这么多次后，暂时不再去问虚拟世界。默认 5 次。"],
+      ["vm_breaker_cooldown", "熔断多久后重试（秒）", "熔断后隔这么久再试一次。默认 60。"],
+    ],
+  },
+  {
+    title: "记录",
+    hint: "存在 router.db 里的数据能留多久。",
+    items: [
+      [
+        "keep_days",
+        "记录保留天数",
+        "判定流水（以及她在群里说过的话的记录）保留多久，插件启动时清掉过期的。默认 30 天。\n" +
+          "看板上的分布图只统计所选窗口内的数据。",
+      ],
+    ],
+  },
 ];
 
 const ui = { token: "", stats: {}, status: {}, params: {}, session: "" };
@@ -185,6 +295,21 @@ async function sendFeedback(id, value) {
   }
 }
 
+/** 批量攒批的当前设置：条数 / 最长等待 / 自适应怎么挪。 */
+function batchLine(batch) {
+  const info = batch || {};
+  if (!info.enabled) return "关（每条立刻判）";
+  const span = Number(info.interval || 0);
+  const low = Number(info.interval_min || 0);
+  const high = Math.min(low * 2, span);
+  const step = Number(info.interval_step || 0);
+  const adaptive =
+    info.adaptive && span > 0
+      ? `，首条等 ${low}~${high}s，之后每条 +≤${step}s（最多到 ${span}s）`
+      : `，固定等 ${span}s`;
+  return `开（攒够 ${info.size} 条或${adaptive}）`;
+}
+
 function renderStatus() {
   const status = ui.status || {};
   const provider = status.willingness_provider || {};
@@ -195,7 +320,7 @@ function renderStatus() {
     `意愿来源：${provider.mode || "-"}`,
     provider.breaker_open ? `VM 熔断中（还剩 ${provider.breaker_seconds}s）` : "VM 正常",
     status.vm_linked ? "已接上虚拟世界" : "没装虚拟世界（用固定意愿）",
-    `批量：${status.batch?.enabled ? `开（${status.batch.size} 条 / ${status.batch.interval}s）` : "关"}`,
+    `批量：${batchLine(status.batch)}`,
     `记录：发言 ${status.storage?.speech || 0} 条 / 判定 ${status.storage?.judgement || 0} 条`,
     provider.last_error ? `最近一次回落：${provider.last_error}` : "",
   ].filter(Boolean);
@@ -216,29 +341,59 @@ function renderStatus() {
   ui.session = select.value;
 }
 
+/** 一个小问号：鼠标停上去（或键盘聚焦）弹出说明，靠近右边时会自动往左展开。 */
+function helpDot(text) {
+  const dot = el("span", "help-dot", "?");
+  dot.setAttribute("data-tip", text);
+  dot.setAttribute("title", text);
+  dot.setAttribute("tabindex", "0");
+  dot.setAttribute("role", "note");
+  dot.addEventListener("mouseenter", () => {
+    const rect = dot.getBoundingClientRect();
+    dot.dataset.side = rect.left + rect.width / 2 > window.innerWidth / 2 ? "right" : "left";
+  });
+  return dot;
+}
+
+function paramField(key, label, hint) {
+  const field = el("label", "field");
+  const head = el("span", "field-head");
+  head.appendChild(el("span", "field-name", label));
+  head.appendChild(helpDot(hint));
+  field.appendChild(head);
+  const value = ui.params[key];
+  if (typeof value === "boolean") {
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = value;
+    input.dataset.key = key;
+    field.appendChild(input);
+  } else {
+    const input = document.createElement("input");
+    input.type = "number";
+    input.step = Number.isInteger(value) ? "1" : "0.01";
+    input.value = value;
+    input.dataset.key = key;
+    field.appendChild(input);
+  }
+  return field;
+}
+
 function renderParams() {
   const box = $("params-form");
   box.innerHTML = "";
-  PARAMS.forEach(([key, label, hint]) => {
-    const field = el("label", "field");
-    field.title = hint;
-    field.appendChild(el("span", "", label));
-    const value = ui.params[key];
-    if (typeof value === "boolean") {
-      const input = document.createElement("input");
-      input.type = "checkbox";
-      input.checked = value;
-      input.dataset.key = key;
-      field.appendChild(input);
-    } else {
-      const input = document.createElement("input");
-      input.type = "number";
-      input.step = Number.isInteger(value) ? "1" : "0.01";
-      input.value = value;
-      input.dataset.key = key;
-      field.appendChild(input);
-    }
-    box.appendChild(field);
+  PARAM_GROUPS.forEach((group) => {
+    const section = el("section", "param-group");
+    const head = el("div", "param-group-head");
+    head.appendChild(el("span", "param-group-title", group.title));
+    if (group.hint) head.appendChild(helpDot(group.hint));
+    section.appendChild(head);
+    const grid = el("div", "params");
+    group.items.forEach(([key, label, hint]) => {
+      grid.appendChild(paramField(key, label, hint));
+    });
+    section.appendChild(grid);
+    box.appendChild(section);
   });
 }
 

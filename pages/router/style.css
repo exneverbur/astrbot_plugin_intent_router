@@ -196,6 +196,92 @@ h2 {
   margin-bottom: 10px;
 }
 
+.param-group {
+  margin-bottom: 14px;
+}
+
+.param-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 6px;
+}
+
+.param-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.field-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.field-name {
+  color: var(--muted);
+}
+
+/* 小白点问号：悬停/聚焦弹出说明，靠近右边时自动往左展开 */
+.help-dot {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+  cursor: help;
+}
+
+.help-dot:hover,
+.help-dot:focus {
+  color: var(--accent);
+  border-color: var(--accent);
+  outline: none;
+}
+
+.help-dot::after {
+  content: attr(data-tip);
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 6px);
+  width: max-content;
+  max-width: min(300px, 60vw);
+  padding: 8px 10px;
+  background: #0d0f14;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.45);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-line;
+  text-align: left;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.12s ease;
+  pointer-events: none;
+  z-index: 30;
+}
+
+.help-dot[data-side="right"]::after {
+  left: auto;
+  right: 0;
+}
+
+.help-dot:hover::after,
+.help-dot:focus::after {
+  opacity: 1;
+  visibility: visible;
+}
+
 .field {
   display: flex;
   flex-direction: column;

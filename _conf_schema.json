@@ -47,15 +47,33 @@
   },
   "batch_size": {
     "description": "攒够几条就判断",
-    "hint": "默认 5 条。",
+    "hint": "缓冲里攒够这么多条就立刻判断，不等剩下的等待时间。默认 5 条。",
     "type": "int",
     "default": 5
   },
   "batch_interval": {
     "description": "最长等待秒数",
-    "hint": "首条消息进队后最多等这么久就强制判断，也是无指向消息的最长回复延迟。默认 30。",
+    "hint": "首条消息进队后最多等这么久就强制判断（硬上限，自适应也不会超过它）。也是无指向消息的最长回复延迟。默认 30。",
     "type": "int",
     "default": 30
+  },
+  "adaptive": {
+    "description": "自适应等待",
+    "hint": "开着：首批消息随机等 interval_min~2×interval_min 秒，之后每来一条新消息再多等 0~interval_step 秒，最多到 batch_interval。冷群回得快，火热群会等到大家说完再开口。关掉则固定等到 batch_interval。默认开。",
+    "type": "bool",
+    "default": true
+  },
+  "interval_min": {
+    "description": "冷群最短等待秒数",
+    "hint": "自适应开启时，只有一两条消息时的大致等待时间（实际取 interval_min~2×interval_min 之间的随机值，不超过 batch_interval）。默认 5。",
+    "type": "int",
+    "default": 5
+  },
+  "interval_step": {
+    "description": "每条新消息再加多少秒",
+    "hint": "自适应开启时，缓冲里每新来一条消息就随机延长 0~interval_step 秒，让火热群多攒几句再判断。填 0 = 新消息不再延长。默认 8。",
+    "type": "int",
+    "default": 8
   },
   "buffer_age": {
     "description": "过期消息丢弃秒数",
