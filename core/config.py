@@ -120,6 +120,10 @@ class Settings:
     bot_persona: str = ""
     group_rules: str = ""
     aliases: list[str] = None  # type: ignore[assignment]
+    alias_policy: str = "judge"
+    """命中别名怎么办：``judge``（默认）= 交给判断模型（命中只是加分项），
+    ``direct`` = 老行为，规则直接放行、不花判断的钱。"""
+
     whitelist: list[str] = None  # type: ignore[assignment]
     blacklist: list[str] = None  # type: ignore[assignment]
     pass_prefixes: list[str] = None  # type: ignore[assignment]
@@ -159,6 +163,9 @@ class Settings:
         )
         self.failure_policy = (
             self.failure_policy if self.failure_policy in ("block", "pass") else "block"
+        )
+        self.alias_policy = (
+            self.alias_policy if self.alias_policy in ("judge", "direct") else "judge"
         )
 
 
@@ -205,6 +212,7 @@ def settings_from_config(config: Any, *, data_dir: str = "") -> Settings:
         bot_persona=cfg_str(config, "persona", "").strip(),
         group_rules=cfg_str(config, "group_rules", "").strip(),
         aliases=cfg_list(config, "bot_aliases"),
+        alias_policy=cfg_str(config, "alias_policy", "judge").strip().lower() or "judge",
         whitelist=cfg_list(config, "whitelist"),
         blacklist=cfg_list(config, "blacklist"),
         pass_prefixes=cfg_list(config, "pass_prefix"),

@@ -124,6 +124,36 @@ class Storage:
             self._conn.commit()
             return bool(cursor.rowcount)
 
+    def update_judgement(
+        self,
+        judgement_id: int,
+        *,
+        worth: bool,
+        scores: dict[str, Any],
+        decision: str,
+        probability: float,
+        breakdown: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        """把一条已经存在的流水补完（判定是后到的，所以先占行、后填内容）。"""
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE judgement SET worth = ?, scores = ?, decision = ?, "
+                "probability = ?, breakdown = ?, reason = ? WHERE id = ?",
+                (
+                    1 if worth else 0,
+                    json.dumps(scores or {}, ensure_ascii=False),
+                    str(decision or ""),
+                    float(probability),
+                    json.dumps(breakdown or {}, ensure_ascii=False),
+                    str(reason or "")[:200],
+                    int(judgement_id),
+                ),
+            )
+            self._conn.commit()
+            return bool(cursor.rowcount)
+
     def mark_merged(self, judgement_id: int, note: str) -> bool:
         """改写这一行的最终去向：同一批里并进了别人的那次开口，没有单独回。
 

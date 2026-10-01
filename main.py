@@ -74,9 +74,16 @@ HANDLER_PRIORITY = 100
 LLM_HOOK_PRIORITY = 90
 REINJECT_EXTRA = "intent_router_reinject"
 PROACTIVE_EXTRA = "intent_router_proactive"
+# 重注入时补的 @ 是假的：原话里没人 @ 她，只是"顺着话题对她说"。
+# 别的插件用这个标记区分两种情况。
+NO_AT_EXTRA = "intent_router_no_at"
 DATA_DIR_ENV = "INTENT_ROUTER_DATA_DIR"
 # 合并放行时，最多把同一批里更早的几句折成背景带上（最新的那几条）
 BURST_LEAD_LINES = 6
+# 「她在等群友拿主意」时问虚拟世界要多久、多久问一次：
+# 问得太勤会跟着每条消息跑一次调用，问得太稀会错过那两三分钟的窗口
+HELP_ASK_TIMEOUT = 0.4
+HELP_ASK_CACHE_SECONDS = 4.0
 
 PROACTIVE_HINT = (
     "\n\n【这一条是偶尔插一句】\n"
@@ -104,7 +111,7 @@ def _resolve_data_dir(plugin_dir: str) -> str:
     PLUGIN_NAME,
     "exneverbur",
     "智能意图路由：判断群里的消息值不值得让主人格开口回复",
-    "v2.1",
+    "v2.3",
 )
 class IntentRouterPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -147,6 +154,9 @@ class IntentRouterPlugin(Star):
         self._deadlines: dict[str, float] = {}
         # 每个会话上一次「真的开口」的时刻（含排队延迟），用来算最小间隔
         self._last_release: dict[str, float] = {}
+        # 「她正在等群友拿主意」的窗口（虚拟世界告诉我们），以及问它的结果缓存
+        self._help_cache: dict[str, tuple[float, float]] = {}
+        self._help_until: dict[str, float] = {}
         self._judge_semaphore = asyncio.Semaphore(self.settings.concurrency)
         self._flush_task: Optional[asyncio.Task] = None
         self._delayed: set[asyncio.Task] = set()
@@ -158,6 +168,7 @@ class IntentRouterPlugin(Star):
             "judged": 0,
             "judge_calls": 0,
             "released": 0,
+            "help_released": 0,
             "delayed": 0,
             "merged": 0,
             "blocked": 0,
@@ -322,30 +333,55 @@ class IntentRouterPlugin(Star):
         text = clean_text(event.message_str or "")
         umo = event.unified_msg_origin
 
+        # 「收到消息」先落一行：判断是后到的，这一行先保证**每条消息都进日志**。
+        # 之后无论走哪条分支，都只用 UPDATE 把这一行补完，不会多出第二条。
+        row_id = self._log_incoming(event, umo, text)
+
         if text:
             self._history_append(umo, text)
 
         # 直接指向她 / 命令：规则触发，不过模型
-        if self._is_direct(event):
+        direct = self._direct_reason(event)
+        if direct:
+            self._close_row(row_id, umo, text, "direct", direct)
             return
         if not self._in_scope(event):
+            self._close_row(row_id, umo, text, "out_of_scope", "不在路由生效的群 / 私聊范围里")
             return
         if not text:
+            self._close_row(row_id, umo, text, "no_text", "没有文本内容（纯图片 / 表情等）")
             return  # 纯图片等没有文本的消息不判断
 
         safety = self.safety.check(text)
         if safety.blocked:
             self.counters["safety_blocked"] += 1
             logger.info("intent_router: 安全层拦下一条消息（%s）", safety.reason)
+            self._close_row(row_id, umo, text, "safety", f"安全层拦下：{safety.reason}")
             self._block_event(event)
             return
         if safety.flagged:
             self.counters["safety_flagged"] += 1
 
+        # 命中了她的名字 / 别名：**交给判断模型**（默认），不当作"直接放行"——
+        # 中文里叫名字可能是叫别人、在讨论她、或者只是口头禅。只有"太短"这条
+        # 噪音判定给它让路：两个字的「蓝蓝」正是在叫她。
+        alias_hits = (
+            [] if self.settings.alias_policy == "direct" else self._alias_hits(text)
+        )
+        if alias_hits:
+            # 只当线索：不给它"直接放行"的待遇，但日志里要能看出这条为什么进判断
+            self.counters["alias_hint"] = int(self.counters.get("alias_hint", 0)) + 1
+            logger.info(
+                "intent_router: 命中了名字「%s」，交给判断模型：%s",
+                "、".join(alias_hits),
+                clip(text, 40),
+            )
         if is_noise(text, min_length=self.settings.min_length, noise_words=self.settings.noise_words):
-            self.counters["noise"] += 1
-            self._block_event(event)
-            return
+            if not alias_hits:
+                self.counters["noise"] += 1
+                self._close_row(row_id, umo, text, "noise", "太短或像语气词，不值得判断")
+                self._block_event(event)
+                return
 
         key = cache_key(umo, text)
         now = time.time()
@@ -359,31 +395,101 @@ class IntentRouterPlugin(Star):
                 verdict=cached,
                 cached=True,
                 deferred=False,
+                judgement_id=row_id,
             )
             return
 
-        item = self._make_item(event, text, key)
+        item = self._make_item(
+            event, text, key, judgement_id=row_id, alias_hits=alias_hits
+        )
         if self.settings.enable_batch:
+            # 她正在群里等群友拿主意时，这几分钟里的消息要尽快交到她手里
+            deadline = await self._intervention_deadline(umo)
+            if deadline > 0:
+                self._help_until[umo] = deadline
             self._buffer_add(umo, item)
             self._block_event(event)
             return
         await self._judge_and_decide([item], umo, deferred=False)
 
+    async def _intervention_deadline(self, umo: str) -> float:
+        """她在等群友拿主意吗？问一次虚拟世界，结果缓存几秒。
+
+        没装虚拟世界、调用超时、出错——一律返回 0，路由照旧工作（同一条不变量）。
+        """
+
+        now = time.time()
+        cached_at, cached_until = self._help_cache.get(umo, (0.0, 0.0))
+        if now - cached_at < HELP_ASK_CACHE_SECONDS:
+            return cached_until if cached_until > now else 0.0
+        until = 0.0
+        vm = self._virtual_world_plugin()
+        getter = getattr(vm, "pending_intervention", None) if vm is not None else None
+        if callable(getter):
+            try:
+                raw = await asyncio.wait_for(getter(umo), timeout=HELP_ASK_TIMEOUT)
+                until = float(raw or 0.0)
+            except Exception as exc:
+                logger.debug(f"intent_router: 问虚拟世界有没有待协助失败：{exc}")
+                until = 0.0
+        if until <= now:
+            until = 0.0
+        self._help_cache[umo] = (now, until)
+        if len(self._help_cache) > 200:
+            self._help_cache.clear()
+            self._help_cache[umo] = (now, until)
+        return until
+
+    def _help_active(self, umo: str) -> bool:
+        """这个会话现在是不是处在「等她拿到回应」的窗口里。"""
+
+        until = float(self._help_until.get(umo, 0.0))
+        if until <= time.time():
+            self._help_until.pop(umo, None)
+            return False
+        return True
+
     def _is_direct(self, event: AstrMessageEvent) -> bool:
         """直接指向她（@、回复、唤醒前缀、命令、叫名字）→ 直接放行，不花判断的钱。"""
 
+        return bool(self._direct_reason(event))
+
+    def _direct_reason(self, event: AstrMessageEvent) -> str:
+        """直接指向她的原因（空串 = 没指向她）。
+
+        规则放行的这几类不过判断模型，但理由要留在流水里：
+        看板上"这条为什么没判"必须一眼看得出。
+        """
+
         if getattr(event, "is_at_or_wake_command", False):
-            return True
+            return "有人 @ 她或用了唤醒词，直接放行"
         if event.get_extra("handlers_parsed_params", {}):
-            return True
+            return "指令参数已解析，直接放行"
         text = event.message_str or ""
         if text.startswith(("/", "!", "！")):
-            return True  # 指令一律放行（含 /router 自己）
+            return "是一条指令，直接放行"
         for prefix in self.settings.pass_prefixes:
             if prefix and text.startswith(prefix):
-                return True
-        lowered = text.lower()
-        return any(alias and alias.lower() in lowered for alias in self.settings.aliases)
+                return f"以「{prefix}」开头，直接放行"
+        if self.settings.alias_policy == "direct":
+            for alias in self._alias_hits(text):
+                return f"提到了名字「{alias}」，直接放行"
+        return ""
+
+    def _alias_hits(self, text: str) -> list[str]:
+        """正文里出现了哪些"她"的名字 / 别名（按出现顺序，去重）。"""
+
+        lowered = str(text or "").lower()
+        hits: list[str] = []
+        if not lowered:
+            return hits
+        for alias in self.settings.aliases:
+            name = str(alias or "").strip()
+            if not name or name in hits:
+                continue
+            if name.lower() in lowered:
+                hits.append(name)
+        return hits
 
     def _in_scope(self, event: AstrMessageEvent) -> bool:
         gid = event.get_group_id()
@@ -404,20 +510,84 @@ class IntentRouterPlugin(Star):
             pass
 
     # ==================================================================
+    # 流水：每条消息先占一行，判定结果后补
+    # ==================================================================
+
+    def _log_incoming(self, event: AstrMessageEvent, umo: str, text: str) -> int:
+        """一条消息到达插件时先占一行流水（decision 暂时是 ``pending``）。
+
+        这样"她为什么没反应"永远能查到：是没到这条插件、还是被规则放行了、
+        还是被判成不值得回。
+        """
+
+        try:
+            return self.storage.record_judgement(
+                umo=umo,
+                ts=time.time(),
+                sender=self._sender_name(event),
+                text=text,
+                worth=False,
+                scores={},
+                decision="pending",
+                probability=0.0,
+                breakdown={"stage": "incoming"},
+                reason="收到消息，等待判断",
+            )
+        except Exception as exc:
+            logger.debug(f"intent_router: 写收到记录失败：{exc}")
+            return 0
+
+    def _close_row(
+        self,
+        judgement_id: int,
+        umo: str,
+        text: str,
+        decision: str,
+        reason: str,
+    ) -> None:
+        """规则直接定性的一条：把占好的那一行补成最终去向。"""
+
+        if not judgement_id:
+            return
+        try:
+            self.storage.update_judgement(
+                judgement_id,
+                worth=False,
+                scores={},
+                decision=decision,
+                probability=0.0,
+                breakdown={"stage": "rule"},
+                reason=reason,
+            )
+        except Exception as exc:
+            logger.debug(f"intent_router: 补写流水失败：{exc}")
+
+    # ==================================================================
     # 缓冲：攒一批再判，省 token
     # ==================================================================
 
-    def _make_item(self, event: AstrMessageEvent, text: str, key: str) -> dict[str, Any]:
+    def _make_item(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        key: str,
+        *,
+        judgement_id: int = 0,
+        alias_hits: list[str] | None = None,
+    ) -> dict[str, Any]:
         self._seq += 1
         return {
             "event": event,
             "text": text,
             "key": key,
+            "judgement_id": int(judgement_id or 0),
             "uuid": uuid.uuid4().hex,
             "ts": time.time(),
             "seq": self._seq,
             "sender": self._sender_name(event),
             "label": self._item_label(event),
+            # 正文里出现了她的名字 / 别名：给判断模型当"更可能是在跟她说话"的线索
+            "alias_hits": list(alias_hits or []),
         }
 
     def _item_label(self, event: AstrMessageEvent) -> str:
@@ -524,6 +694,9 @@ class IntentRouterPlugin(Star):
                         items,
                         umo,
                     )
+            elif deferred and self._help_active(umo):
+                # 判断模型挂了也不能让她干等：她正在等回应，这一批照样送到
+                self._release_batch([], items, umo)
             else:
                 self.counters["blocked"] += len(items)
                 for item in items:
@@ -536,6 +709,13 @@ class IntentRouterPlugin(Star):
                 # 模型漏了这条：当成不值得回，别去打扰主人格
                 self.cache.set(item["key"], Verdict(idx=index, worth=False), time.time())
                 self.counters["blocked"] += 1
+                self._close_row(
+                    int(item.get("judgement_id") or 0),
+                    umo,
+                    item["text"],
+                    "ignore",
+                    "判断结果里没有这一条，按不回处理",
+                )
                 self._block_event(item["event"])
                 continue
             self.cache.set(item["key"], verdict, time.time())
@@ -545,13 +725,14 @@ class IntentRouterPlugin(Star):
                 text=item["text"],
                 verdict=verdict,
                 deferred=deferred,
+                judgement_id=int(item.get("judgement_id") or 0),
             )
             if release is not None:
                 ready.append(
                     {"item": item, "delay": release[0], "judgement": release[1]}
                 )
         # 放行统一放在批处理这一层：一批里每条各自放行的话，她一句话就会回一屏
-        if deferred and ready:
+        if deferred and (ready or self._help_active(umo)):
             self._release_batch(ready, items, umo)
 
     async def _apply_decision(
@@ -563,6 +744,7 @@ class IntentRouterPlugin(Star):
         verdict: Verdict,
         cached: bool = False,
         deferred: bool = True,
+        judgement_id: int = 0,
     ) -> Optional[tuple[float, int]]:
         """把一条判断落成"回 / 插一句 / 不回"，并写进流水。
 
@@ -578,6 +760,7 @@ class IntentRouterPlugin(Star):
         if willing.sleeping:
             # 她在睡觉：静默，连记录都不用（睡眠门禁在 VM 那边也有，这里再挡一道）
             self.counters["blocked"] += 1
+            self._close_row(judgement_id, umo, text, "blocked", "她正在睡觉，静默挡下")
             self._block_event(event)
             return None
 
@@ -594,6 +777,7 @@ class IntentRouterPlugin(Star):
                 reason=safety.reason,
                 willing=willing.value,
                 snapshot=snapshot,
+                judgement_id=judgement_id,
             )
             return None
 
@@ -613,14 +797,19 @@ class IntentRouterPlugin(Star):
                 reason=outcome.reason,
                 willing=willing.value,
                 snapshot=snapshot,
+                judgement_id=judgement_id,
             )
             if self.debug:
                 logger.info(
-                    "intent_router 放行：%s（worth=%s score=%.2f 意愿=%.2f %s）",
+                    "intent_router 放行给 %s（stop=%s）：%s"
+                    "（worth=%s score=%.2f 意愿=%.2f 去向=%s %s）",
+                    umo,
+                    not deferred,
                     clip(text, 40),
                     verdict.worth,
                     verdict.reply_score,
                     willing.value,
+                    outcome.decision,
                     "缓存" if cached else "",
                 )
             return (float(outcome.delay or 0.0), judgement)
@@ -641,6 +830,7 @@ class IntentRouterPlugin(Star):
             reason=outcome.reason,
             willing=willing.value,
             snapshot=snapshot,
+            judgement_id=judgement_id,
         )
         if outcome.decision == PROACTIVE and random.random() < outcome.probability:
             self.counters["proactive"] += 1
@@ -677,10 +867,33 @@ class IntentRouterPlugin(Star):
         reason: str,
         willing: float,
         snapshot: Any,
+        judgement_id: int = 0,
     ) -> int:
         """写一条判定流水，返回它的 id（看板上就是那一行的编号）。"""
 
+        breakdown = {
+            "willingness": round(float(willing), 4),
+            "weighted_recent": snapshot.weighted_recent,
+            "normalized_load": snapshot.normalized_load,
+            "silence_seconds": snapshot.silence_seconds,
+            "counts": snapshot.counts,
+            "to": verdict.to,
+            "directed": verdict.directed,
+            "suggested_action": verdict.suggested_action,
+        }
         try:
+            if judgement_id:
+                # 这一行在收到消息时就占好了：就地补完，不新开一行
+                ok = self.storage.update_judgement(
+                    judgement_id,
+                    worth=verdict.worth,
+                    scores=verdict.scores(),
+                    decision=decision,
+                    probability=probability,
+                    breakdown=breakdown,
+                    reason=reason,
+                )
+                return int(judgement_id) if ok else 0
             return self.storage.record_judgement(
                 umo=umo,
                 ts=time.time(),
@@ -690,16 +903,7 @@ class IntentRouterPlugin(Star):
                 scores=verdict.scores(),
                 decision=decision,
                 probability=probability,
-                breakdown={
-                    "willingness": round(float(willing), 4),
-                    "weighted_recent": snapshot.weighted_recent,
-                    "normalized_load": snapshot.normalized_load,
-                    "silence_seconds": snapshot.silence_seconds,
-                    "counts": snapshot.counts,
-                    "to": verdict.to,
-                    "directed": verdict.directed,
-                    "suggested_action": verdict.suggested_action,
-                },
+                breakdown=breakdown,
                 reason=reason,
             )
         except Exception as exc:
@@ -720,9 +924,19 @@ class IntentRouterPlugin(Star):
         """
 
         if not ready:
-            return
+            if not self._help_active(umo):
+                return
+            ready = []
         ordered = sorted(ready, key=lambda entry: int(entry["item"].get("seq") or 0))
-        if self.settings.release_policy == "latest":
+        if self._help_active(umo):
+            # 她正在等群友拿主意：这一批全都交给她（最新那条当正文，其余折成背景），
+            # 而且跳过最小间隔——等建议的时候不该按「别连着开口」压着。
+            newest = max(items, key=lambda item: int(item.get("seq") or 0))
+            picked = [
+                {"item": newest, "delay": 0.0, "judgement": 0, "help": True, "lead": self._burst_lead(items, newest)}
+            ]
+            self.counters["help_released"] += 1
+        elif self.settings.release_policy == "latest":
             picked = [ordered[-1]]
             for entry in ordered[:-1]:
                 self.counters["merged"] += 1
@@ -737,9 +951,11 @@ class IntentRouterPlugin(Star):
         """把一条放回管道：该等就等（意愿排队 + 会话最小间隔），到点再重注入。"""
 
         delay = max(0.0, float(entry.get("delay") or 0.0))
-        cooldown = self._cooldown_wait(umo)
-        if cooldown > delay:
-            delay = cooldown
+        if not entry.get("help"):
+            # 等她拿到回应这一档不受「两次开口的最小间隔」限制
+            cooldown = self._cooldown_wait(umo)
+            if cooldown > delay:
+                delay = cooldown
         if delay > 0:
             self.counters["delayed"] += 1
             self._schedule_release(
@@ -832,7 +1048,11 @@ class IntentRouterPlugin(Star):
                     for item in chain
                 )
                 if not has_at_self:
+                    # 补一个 @ 只是为了让消息重新走通管道（下游按"有人叫她"处理）。
+                    # 但原话里其实没 @ 她，所以要留个标记：别的插件用它区分
+                    # 「真的被点名」和「顺着话题对她说」。
                     chain.insert(0, At(qq=self_id, name=self_id))
+                    new_event.set_extra(NO_AT_EXTRA, True)
             if lead:
                 body = str(new_event.message_str or "").strip()
                 head = str(lead).strip()
@@ -854,7 +1074,13 @@ class IntentRouterPlugin(Star):
             return {}
         history = self._history_lines(umo)
         payload = [
-            {"idx": index, "sender": item["sender"], "label": item["label"], "text": item["text"]}
+            {
+                "idx": index,
+                "sender": item["sender"],
+                "label": item["label"],
+                "text": item["text"],
+                "alias_hits": list(item.get("alias_hits") or []),
+            }
             for index, item in enumerate(items, start=1)
         ]
         system_prompt = self.judge_prompt.system()
