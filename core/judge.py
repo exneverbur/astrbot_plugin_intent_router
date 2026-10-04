@@ -164,8 +164,16 @@ def parse_judge_output(raw: str) -> dict[int, Verdict]:
     return verdicts
 
 
-def cache_key(umo: str, text: str) -> str:
-    return hashlib.sha1(f"{umo}|{clip(text, 200)}".encode("utf-8")).hexdigest()
+def cache_key(umo: str, text: str, *, sender: str = "", reply_to: str = "") -> str:
+    """缓存键：会话 + 说话人 + 被引用的人 + 正文。
+
+    只有会话与正文时，同一句「好啊」在「回答机器人」「回答群友」「一群人闲聊」
+    之间会互相复用判定——**说的对象不同，含义就完全不同**。说话人一换、被引用的人
+    一换，也都不该复用（设计评审 §2 的第一条风险）。
+    """
+
+    raw = f"{umo}|{sender}|{reply_to}|{clip(text, 200)}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
 class JudgeCache:

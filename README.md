@@ -86,6 +86,22 @@
 - 她**正在等群友拿主意**时（在群里求助的那几分钟），本插件会把那个会话的消息**合并放行、
   跳过回复冷却**，让群友的回应尽快交到她手里；问不到 VM 时一切照旧。
 
+### 交给她的事前判定（`intent_router_decision`）
+
+被放行的那条事件上带一份**整批判定**，她可以据此知道「哪几条是在跟她说的」——
+这是回复之前就知道的，不用等回完再让主模型猜：
+
+```python
+decision = event.get_extra("intent_router_decision")
+# {"umo": ..., "policy": "latest", "at": 1710.0,
+#  "batch": [{"sender", "sender_id", "message_id", "text",
+#             "released", "worth", "directed", "to", "reply_score", "reason"}, ...]}
+```
+
+`batch` 按到达顺序列出这一批**每一条**（包括被合并成一次回复、正文没进请求的那几条），
+`released` 标出真正放行的是哪一条；照着 `message_id` 就能认领自己已经留过档的记录。
+另外 `intent_router_no_at`（本插件补的 @ 是假的）与 `intent_router_reinject` 语义不变。
+
 ## 数据
 
 都在 AstrBot 的 `data/plugin_data/astrbot_plugin_intent_router/`：

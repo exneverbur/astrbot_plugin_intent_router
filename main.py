@@ -73,6 +73,10 @@ HANDLER_PRIORITY = 100
 # 比 VM 的 -100 高，这样"主动插嘴"的约束会追加在它那段世界认知之后
 LLM_HOOK_PRIORITY = 90
 REINJECT_EXTRA = "intent_router_reinject"
+# 交给下游插件（虚拟世界）的整批判定：谁被放行了、整批逐条判成什么样。
+# 「这句是不是冲她说的」只有路由模型在事前判得出来，而放行的消息会被重投，
+# 下游就在那一次读到它（见 docs 里的交接说明）。
+DECISION_EXTRA = "intent_router_decision"
 PROACTIVE_EXTRA = "intent_router_proactive"
 # 重注入时补的 @ 是假的：原话里没人 @ 她，只是"顺着话题对她说"。
 # 别的插件用这个标记区分两种情况。
@@ -111,7 +115,7 @@ def _resolve_data_dir(plugin_dir: str) -> str:
     PLUGIN_NAME,
     "exneverbur",
     "智能意图路由：判断群里的消息值不值得让主人格开口回复",
-    "v2.3",
+    "v2.4",
 )
 class IntentRouterPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -383,7 +387,12 @@ class IntentRouterPlugin(Star):
                 self._block_event(event)
                 return
 
-        key = cache_key(umo, text)
+        key = cache_key(
+            umo,
+            text,
+            sender=str(event.get_sender_id() or ""),
+            reply_to=self._reply_target_id(event),
+        )
         now = time.time()
         cached = self.cache.get(key, now)
         if cached is not None:
@@ -576,6 +585,7 @@ class IntentRouterPlugin(Star):
         alias_hits: list[str] | None = None,
     ) -> dict[str, Any]:
         self._seq += 1
+        message_obj = getattr(event, "message_obj", None)
         return {
             "event": event,
             "text": text,
@@ -585,6 +595,10 @@ class IntentRouterPlugin(Star):
             "ts": time.time(),
             "seq": self._seq,
             "sender": self._sender_name(event),
+            # 交接给下游插件用的身份：它按 message_id 认自己已经留过档的那几条
+            "sender_id": str(event.get_sender_id() or ""),
+            "message_id": str(getattr(message_obj, "message_id", "") or ""),
+            "reply_to": self._reply_target_id(event),
             "label": self._item_label(event),
             # 正文里出现了她的名字 / 别名：给判断模型当"更可能是在跟她说话"的线索
             "alias_hits": list(alias_hits or []),
@@ -707,7 +721,9 @@ class IntentRouterPlugin(Star):
             verdict = verdicts.get(index)
             if verdict is None:
                 # 模型漏了这条：当成不值得回，别去打扰主人格
-                self.cache.set(item["key"], Verdict(idx=index, worth=False), time.time())
+                verdict = Verdict(idx=index, worth=False)
+                item["verdict"] = verdict
+                self.cache.set(item["key"], verdict, time.time())
                 self.counters["blocked"] += 1
                 self._close_row(
                     int(item.get("judgement_id") or 0),
@@ -719,6 +735,8 @@ class IntentRouterPlugin(Star):
                 self._block_event(item["event"])
                 continue
             self.cache.set(item["key"], verdict, time.time())
+            # 交接元数据要逐条带上判定（批次里每条各是什么结论）
+            item["verdict"] = verdict
             release = await self._apply_decision(
                 event=item["event"],
                 umo=umo,
@@ -836,6 +854,16 @@ class IntentRouterPlugin(Star):
             self.counters["proactive"] += 1
             try:
                 event.set_extra(PROACTIVE_EXTRA, True)
+                # 即时路径（没开批量）不重投，下游只能在 on_llm_request 里读这份判定
+                if not deferred:
+                    only = {
+                        "seq": 0,
+                        "sender": self._sender_name(event),
+                        "sender_id": str(event.get_sender_id() or ""),
+                        "text": text,
+                        "verdict": verdict,
+                    }
+                    event.set_extra(DECISION_EXTRA, self._batch_payload([only], {0}, umo))
             except Exception:
                 pass
             logger.info(
@@ -933,7 +961,13 @@ class IntentRouterPlugin(Star):
             # 而且跳过最小间隔——等建议的时候不该按「别连着开口」压着。
             newest = max(items, key=lambda item: int(item.get("seq") or 0))
             picked = [
-                {"item": newest, "delay": 0.0, "judgement": 0, "help": True, "lead": self._burst_lead(items, newest)}
+                {
+                    "item": newest,
+                    "delay": 0.0,
+                    "judgement": 0,
+                    "help": True,
+                    "lead": self._burst_lead(items, newest, umo),
+                }
             ]
             self.counters["help_released"] += 1
         elif self.settings.release_policy == "latest":
@@ -941,11 +975,49 @@ class IntentRouterPlugin(Star):
             for entry in ordered[:-1]:
                 self.counters["merged"] += 1
                 self._mark_merged(entry.get("judgement"))
-            picked[0]["lead"] = self._burst_lead(items, picked[0]["item"])
+            picked[0]["lead"] = self._burst_lead(items, picked[0]["item"], umo)
         else:
             picked = ordered
+        # 这一批判定原样交给下游插件：被拦下的那几条它读不到（它比路由先跑），
+        # 所以放行时一次带全，它才能按 message_id 认领自己已经留过档的每一条。
+        chosen = {int(entry["item"].get("seq") or 0) for entry in picked}
+        payload = self._batch_payload(items, chosen, umo)
         for entry in picked:
+            entry["decision"] = payload
             self._release_entry(entry, umo)
+
+    def _batch_payload(
+        self, items: list[dict[str, Any]], chosen: set[int], umo: str
+    ) -> dict[str, Any]:
+        """整批判定（含被合并掉的每一条），交给下游插件的一次性元数据。
+
+        「这句是不是冲她说的」只有判断模型在事前答得出来；下游拿到它，就能给
+        自己已经存下的那几条标上，而不是等回复之后靠主模型猜。
+        """
+
+        batch: list[dict[str, Any]] = []
+        for item in sorted(items, key=lambda entry: int(entry.get("seq") or 0)):
+            verdict = item.get("verdict")
+            batch.append(
+                {
+                    "sender": str(item.get("sender") or ""),
+                    "sender_id": str(item.get("sender_id") or ""),
+                    "message_id": str(item.get("message_id") or ""),
+                    "text": clip(str(item.get("text") or ""), 200),
+                    "released": int(item.get("seq") or 0) in chosen,
+                    "worth": bool(getattr(verdict, "worth", False)),
+                    "directed": bool(getattr(verdict, "directed", False)),
+                    "to": str(getattr(verdict, "to", "") or ""),
+                    "reply_score": float(getattr(verdict, "reply_score", 0.0) or 0.0),
+                    "reason": str(getattr(verdict, "reason", "") or ""),
+                }
+            )
+        return {
+            "umo": umo,
+            "policy": str(getattr(self.settings, "release_policy", "") or "latest"),
+            "at": time.time(),
+            "batch": batch,
+        }
 
     def _release_entry(self, entry: dict[str, Any], umo: str) -> None:
         """把一条放回管道：该等就等（意愿排队 + 会话最小间隔），到点再重注入。"""
@@ -959,10 +1031,17 @@ class IntentRouterPlugin(Star):
         if delay > 0:
             self.counters["delayed"] += 1
             self._schedule_release(
-                entry["item"]["event"], delay, lead=str(entry.get("lead") or "")
+                entry["item"]["event"],
+                delay,
+                lead=str(entry.get("lead") or ""),
+                decision=entry.get("decision"),
             )
         else:
-            self._release_now(entry["item"]["event"], str(entry.get("lead") or ""))
+            self._release_now(
+                entry["item"]["event"],
+                str(entry.get("lead") or ""),
+                decision=entry.get("decision"),
+            )
         # 记的是"真的发出去"的时刻，后面几条都按它算间隔
         self._last_release[umo] = time.time() + delay
 
@@ -974,12 +1053,22 @@ class IntentRouterPlugin(Star):
             return 0.0
         return max(0.0, last + float(self.tunable.reply_cooldown_seconds) - time.time())
 
-    def _burst_lead(self, items: list[dict[str, Any]], chosen: dict[str, Any]) -> str:
+    def _burst_lead(
+        self, items: list[dict[str, Any]], chosen: dict[str, Any], umo: str = ""
+    ) -> str:
         """同一批里比它更早的那几句，折成一小段背景带上。
 
         这些消息早被打回了，主人格本来只看得见最后一条；带上背景她才接得上话。
+
+        但如果虚拟世界插件**正在照看这个会话**就不拼（返回空串）：它的旁观钩子
+        已经按事件身份把这几条独立留了档，再折一遍文本，主模型请求里同一句话就
+        会出现两份——VM 排除重投事件时只能按事件身份排掉外层那条，排不掉正文里
+        内嵌的旧文本。VM 没装 / 没启用 / 没在照看这个会话时照旧拼：批量上下文是
+        给「这几条不会单独进她的提示词」的会话用的，不能一并关掉。
         """
 
+        if self._vm_context_active(umo):
+            return ""
         chosen_seq = int(chosen.get("seq") or 0)
         lines = [
             f"{str(item.get('sender') or '有人')}：{clip(str(item.get('text') or ''), 60)}"
@@ -1003,14 +1092,19 @@ class IntentRouterPlugin(Star):
             self.storage.mark_merged(judgement_id, "；同一批里被合并成一次回复")
 
     def _schedule_release(
-        self, event: AstrMessageEvent, delay: float, *, lead: str = ""
+        self,
+        event: AstrMessageEvent,
+        delay: float,
+        *,
+        lead: str = "",
+        decision: Optional[dict[str, Any]] = None,
     ) -> None:
         """排队延迟一会儿再放行（而不是直接拒绝）。"""
 
         async def later() -> None:
             try:
                 await asyncio.sleep(max(0.0, delay))
-                self._release_now(event, lead)
+                self._release_now(event, lead, decision=decision)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1020,14 +1114,28 @@ class IntentRouterPlugin(Star):
         self._delayed.add(task)
         task.add_done_callback(self._delayed.discard)
 
-    def _release_now(self, event: AstrMessageEvent, lead: str = "") -> None:
-        self._reinject(event, lead=lead)
+    def _release_now(
+        self,
+        event: AstrMessageEvent,
+        lead: str = "",
+        *,
+        decision: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self._reinject(event, lead=lead, decision=decision)
         self.counters["released"] += 1
 
-    def _reinject(self, event: AstrMessageEvent, *, lead: str = "") -> None:
+    def _reinject(
+        self,
+        event: AstrMessageEvent,
+        *,
+        lead: str = "",
+        decision: Optional[dict[str, Any]] = None,
+    ) -> None:
         """把消息副本（带 At 唤醒标记）放回事件队列，重新走一遍管道。
 
-        ``lead`` 是这一批里更早的几句（见 :meth:`_burst_lead`），拼在正文前面。
+        ``lead`` 是这一批里更早的几句（见 :meth:`_burst_lead`），拼在正文前面；
+        ``decision`` 是整批判定（见 :meth:`_batch_payload`），原样挂在事件上给
+        下游插件读——批次里被拦下的几条它当时读不到，只有这一次机会拿到。
         """
 
         try:
@@ -1043,6 +1151,12 @@ class IntentRouterPlugin(Star):
             chain = getattr(message_obj, "message", None)
             self_id = event.get_self_id()
             if isinstance(chain, list):
+                # 只复制要改的这一层：message_obj 与它自己的消息列表。链不能就地改——
+                # 它属于原事件，队列里别的消费者会看到凭空多出来的 @。也不整个深拷贝：
+                # sender / group / raw_message / message_id 是平台对象的身份，应当共享。
+                new_event.message_obj = copy.copy(message_obj)
+                chain = list(chain)
+                new_event.message_obj.message = chain
                 has_at_self = any(
                     isinstance(item, At) and str(getattr(item, "qq", "")) == str(self_id)
                     for item in chain
@@ -1058,6 +1172,8 @@ class IntentRouterPlugin(Star):
                 head = str(lead).strip()
                 new_event.message_str = f"{head}\n{body}".strip()
             new_event.set_extra(REINJECT_EXTRA, True)
+            if decision:
+                new_event.set_extra(DECISION_EXTRA, decision)
             self.context.get_event_queue().put_nowait(new_event)
         except Exception as exc:
             self.counters["reinject_failed"] += 1
@@ -1180,6 +1296,24 @@ class IntentRouterPlugin(Star):
                 return nick or str(getattr(component, "sender_id", "") or "")
         return ""
 
+    @staticmethod
+    def _reply_target_id(event: AstrMessageEvent) -> str:
+        """被引用的那条是谁发的（没有引用就返回空串）。
+
+        缓存键与交接元数据都要它：同一句正文「回复机器人」和「回复群友」不是一个意思。
+        """
+
+        message_obj = getattr(event, "message_obj", None)
+        for component in list(getattr(message_obj, "message", []) or []):
+            if isinstance(component, Reply):
+                return str(
+                    getattr(component, "sender_id", "")
+                    or getattr(component, "sender_nickname", "")
+                    or getattr(component, "id", "")
+                    or ""
+                )
+        return ""
+
     def _history_append(self, umo: str, text: str) -> None:
         history = self._history.setdefault(umo, deque(maxlen=40))
         history.append((time.time(), clip(text, 200)))
@@ -1200,6 +1334,49 @@ class IntentRouterPlugin(Star):
             if getattr(meta, "name", "") == "astrbot_plugin_virtual_world":
                 return getattr(meta, "star_cls", None)
         return None
+
+    def _vm_context_active(self, umo: str = "") -> bool:
+        """虚拟世界插件在场、开着，而且**正在照看这个会话**吗？
+
+        VM 自带旁观钩子，会按事件身份独立留档群里那几条消息；它拿不到"这一批是
+        路由折过来的"这个信息。所以只要 VM 在照看这个会话，路由就不能把更早几句
+        拼成文本塞进正文（见 :meth:`_burst_lead`），否则同一句话会进主模型请求两遍。
+
+        启用状态以实例属性 ``enabled`` 为准（VM 在 ``__init__`` 里从配置读出来）。
+        VM 装是装了、但没把这个会话加进它的列表时**照旧拼**：那几条不会单独进她的
+        提示词，折成背景反而是这几条唯一的来路（会话列表见
+        ``core/engine.py`` 的 ``enabled_session_ids()``，里面的 id 与这里的 umo
+        是同一套字符串）。
+
+        说不清的时候（没给 umo、VM 版本没有这个方法、调用抛异常）按"在照看"处理：
+        宁可少拼一段背景，也不要重复上下文。
+        """
+
+        vm = self._virtual_world_plugin()
+        if vm is None:
+            return False
+        if not bool(getattr(vm, "enabled", True)):
+            return False
+        target = str(umo or "")
+        if not target:
+            return True
+        engine = getattr(vm, "engine", None)
+        watcher = getattr(engine, "enabled_session_ids", None)
+        if not callable(watcher):
+            return True
+        try:
+            watched = {str(item) for item in (watcher() or []) if str(item)}
+        except Exception as exc:
+            logger.debug(f"intent_router: 读虚拟世界的会话列表失败：{exc}")
+            return True
+        if not watched:
+            # 她那边一个会话都没启用：旁观钩子连留档都不会做（VM 的 handle_incoming
+            # 先过 is_enabled 才会 _record_user_message），折背景没有重复风险
+            return False
+        if target in watched:
+            return True
+        # 容错：配置里写的是短名（比如 vwgroup）时也算它在照看
+        return any(target.endswith(item) or item.endswith(target) for item in watched)
 
     # ==================================================================
     # 看板用的 Web API
